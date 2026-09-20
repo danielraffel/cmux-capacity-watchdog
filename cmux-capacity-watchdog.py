@@ -33,7 +33,7 @@ CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-09-19.6"
+WATCHDOG_VERSION = "2026-09-19.7"
 
 # A turn is running when any of these appear in the tail.
 BUSY_MARKERS = ("esc to interrupt",)
@@ -358,10 +358,14 @@ def send_once(cfg: Config, watcher: Watcher, command: str, state: str, marker: s
         record(cfg, "composer_race_aborted", surface=watcher.surface, command=command)
         notify("watchdog: composer race", f"{watcher.surface}: aborted a resume rather than submit a mixed draft")
         watcher.next_action_at = time.time() + 120
+        # Nothing was submitted, so the stop is still standing: re-arm the
+        # marker or the novelty gate would dead-letter this stop forever.
+        watcher.marker_seen = ""
         return "error"
     except Exception as exc:
         log(cfg, f"{watcher.surface}: send failed: {exc}")
         record(cfg, "send_error", surface=watcher.surface, command=command, error=str(exc))
+        watcher.marker_seen = ""  # see above: no submission, stop still standing
         return "error"
     confirmed, post_state, post_tail = verify_resumed(watcher.surface)
     if confirmed:
@@ -468,6 +472,11 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
         watcher.actions_on_stop += 1
         outcome = send_once(cfg, watcher, command, state, marker, "fast")
         if outcome == "confirmed":
+            return
+        if outcome == "error":
+            # A composer race means the user is typing right now; a transport
+            # error means cmux is unhappy. Either way the ladder stops here
+            # and the error path's own retry timing applies.
             return
         if watcher.actions_on_stop >= MAX_ACTIONS_PER_STOP:
             break
