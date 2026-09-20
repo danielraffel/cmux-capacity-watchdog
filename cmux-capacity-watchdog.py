@@ -57,11 +57,16 @@ WITNESS_FRESHNESS = 2 * 3600  # seconds since last seen busy
 WITNESS_FILE = os.path.expanduser("~/.local/state/cmux-capacity-watchdog-witness.json")
 
 
-def load_witnesses() -> dict:
+def load_witnesses(log_fn=print) -> dict:
     try:
         with open(WITNESS_FILE) as handle:
             return {k: float(v) for k, v in json.load(handle).items()}
-    except Exception:
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        # Failing closed (treating every stop as unwitnessed) is safe, but it
+        # must be loud: otherwise a corrupted file silently disables resumes.
+        log_fn(f"witness file unreadable ({exc}); stopped sessions fail closed until seen busy")
         return {}
 
 
@@ -95,8 +100,12 @@ def load_ignore_rules() -> tuple:
                     title_parts.append(line[len("title:"):].strip().lower())
                 else:
                     ids.add(line)
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as exc:
+        # An unreadable ignore file means exclusions are not in force — that
+        # fails OPEN, so say so loudly rather than resuming excluded sessions.
+        print(f"WARNING: ignore file unreadable ({exc}); exclusions not in force", flush=True)
     return ids, title_parts
 
 
@@ -107,10 +116,13 @@ def is_ignored(rules, surface: str, title: str) -> bool:
     lowered = title.lower()
     return any(part in lowered for part in title_parts)
 
-MAX_ACTIONS_PER_STOP = 3
-ACTION_BACKOFF = (30, 60, 120)  # seconds between repeated actions on the same stop
+# A dozen fast attempts with exponential backoff (5s, 10s, 20s, ... capped at
+# 60s), then the slow lane: one retry every 5 minutes. The witness freshness
+# window bounds the slow lane to ~2h after the last busy sighting.
+MAX_ACTIONS_PER_STOP = 12
+FAST_BACKOFF_CAP = 60           # seconds
 STALL_POLLS_REQUIRED = 2        # an idle "pursuing goal" footer must persist before acting
-SLOW_LANE_INTERVAL = 900        # after the fast attempts: one retry every 15 min until the storm passes
+SLOW_LANE_INTERVAL = 300        # after the fast attempts: one retry every 5 min until the storm passes
 VERIFY_WAIT = 4.0
 
 
@@ -183,11 +195,15 @@ def tail_excerpt(tail: str, limit: int = 300) -> str:
     return excerpt[:limit]
 
 
-def fingerprint(state: str, tail: str) -> str:
-    # Strip digits so ticking timers and rotating reset times do not make every
-    # poll look like a new stop.
-    normalized = "".join("#" if c.isdigit() else c for c in tail.lower())
-    return hashlib.sha1(f"{state}\n{normalized}".encode()).hexdigest()[:12]
+def fingerprint(state: str, marker: str, tail: str) -> str:
+    # Identify the stop by its state, its evidence marker, and the last couple
+    # of screen lines — not the whole tail, whose unrelated churn would
+    # otherwise reset the per-stop attempt budget. Digits are stripped so
+    # ticking timers and rotating reset times read as one stop.
+    lines = [line.strip() for line in tail.splitlines() if line.strip()]
+    relevant = " | ".join(lines[-2:]).lower()
+    normalized = "".join("#" if c.isdigit() else c for c in relevant)
+    return hashlib.sha1(f"{state}\n{marker}\n{normalized}".encode()).hexdigest()[:12]
 
 
 @dataclass
@@ -260,7 +276,7 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
     if watcher.last_seen_busy == 0 or time.time() - watcher.last_seen_busy > WITNESS_FRESHNESS:
         # Never witnessed busy (or not recently): almost certainly a
         # deliberately stopped or abandoned session, so leave it alone.
-        fp = fingerprint(state, tail)
+        fp = fingerprint(state, marker, tail)
         if fp != watcher.last_fingerprint:
             watcher.last_fingerprint = fp
             age = "never" if watcher.last_seen_busy == 0 else f"{int((time.time() - watcher.last_seen_busy) / 3600)}h ago"
@@ -271,7 +287,7 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
                    fingerprint=fp, excerpt=tail_excerpt(tail))
         return
     if state == "goal-paused-no-error":
-        fp = fingerprint(state, tail)
+        fp = fingerprint(state, marker, tail)
         if fp != watcher.last_fingerprint:
             watcher.last_fingerprint = fp
             log(cfg, f"{watcher.surface}: goal paused without an error on screen; deliberate pause, leaving it")
@@ -280,7 +296,7 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
         return
     command = "continue" if state == "capacity-stopped" else "/goal resume"
     now = time.time()
-    fp = fingerprint(state, tail)
+    fp = fingerprint(state, marker, tail)
     if fp != watcher.last_fingerprint:
         # A new stop (or the first one seen): reset the per-stop bookkeeping.
         watcher.last_fingerprint = fp
@@ -299,23 +315,26 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
         watcher.next_action_at = now + 60
         return
     if watcher.actions_on_stop >= MAX_ACTIONS_PER_STOP:
-        # Fast attempts are spent; drop to the slow lane instead of locking up
-        # or giving up — a capacity storm passes, and one gentle retry every
-        # 15 minutes rides it out without hammering the client.
+        # Fast attempts are spent; drop to the slow lane — one gentle retry
+        # every 5 minutes until the storm passes. The send below still
+        # happens; only the scheduling differs. (An earlier revision returned
+        # here without sending, so the slow lane never actually retried.)
         if not watcher.parked:
             watcher.parked = True
             log(cfg, f"{watcher.surface}: slow lane after {watcher.actions_on_stop} quick attempts; retrying every {SLOW_LANE_INTERVAL // 60}m")
             record(cfg, "slow_lane", surface=watcher.surface, attempts=watcher.actions_on_stop)
             notify("watchdog: session in slow lane", f"{watcher.surface} keeps failing to resume")
         watcher.next_action_at = now + SLOW_LANE_INTERVAL
-        return
-    watcher.actions_on_stop += 1
-    backoff = ACTION_BACKOFF[min(watcher.actions_on_stop - 1, len(ACTION_BACKOFF) - 1)]
-    watcher.next_action_at = now + backoff
+        watcher.actions_on_stop += 1
+        lane = "slow"
+    else:
+        watcher.actions_on_stop += 1
+        backoff = min(FAST_BACKOFF_CAP, 5 * (2 ** (watcher.actions_on_stop - 1)))
+        watcher.next_action_at = now + backoff
+        lane = "fast"
     if cfg.dry_run:
-        log(cfg, f"{watcher.surface}: DRY-RUN would send {command!r} (attempt {watcher.actions_on_stop})")
+        log(cfg, f"{watcher.surface}: DRY-RUN would send {command!r} (attempt {watcher.actions_on_stop}, {lane} lane)")
         return
-    lane = "fast" if watcher.actions_on_stop <= MAX_ACTIONS_PER_STOP else "slow"
     log(cfg, f"{watcher.surface}: {state}; sending {command!r} because {marker!r} (attempt {watcher.actions_on_stop}, {lane} lane)")
     record(cfg, "action", surface=watcher.surface, title=watcher.title,
            state=state, marker=marker, command=command, attempt=watcher.actions_on_stop, lane=lane)
@@ -447,7 +466,7 @@ def report(stats_file: str) -> int:
                 print(f"    e.g. {example[:180]}")
 
     # Fast vs slow lane: how much work each lane does and whether the slow
-    # lane ever lands a resume — the input for tuning the 15-minute cool-off.
+    # lane ever lands a resume — the input for tuning the 5-minute cool-off.
     fast_actions = [e for e in actions if e.get("lane") == "fast"]
     slow_actions = [e for e in actions if e.get("lane") == "slow"]
     if fast_actions or slow_actions:
@@ -502,13 +521,14 @@ def main() -> int:
         parser.error("give at least one --surface or pass --all-codex")
 
     cfg = Config(interval=args.interval, dry_run=args.dry_run, log_file=args.log, stats_file=args.stats)
-    witnesses = load_witnesses()
+    witnesses = load_witnesses(lambda message: log(cfg, message))
     for surface in args.surface:
         cfg.watchers[surface] = Watcher(surface=surface, last_seen_busy=witnesses.get(surface, 0.0))
     log(cfg, f"watching {len(cfg.watchers)} surface(s), interval {cfg.interval}s, dry_run={cfg.dry_run}, all_codex={args.all_codex}")
 
     last_discovery = 0.0
     witnesses_dirty = False
+    last_witness_save = 0.0
     while True:
         cfg.ignore_rules = load_ignore_rules()
         if args.all_codex and time.time() - last_discovery >= DISCOVERY_INTERVAL:
@@ -537,7 +557,7 @@ def main() -> int:
                     # future policy.
                     watcher.stalled_polls += 1
                     if watcher.stalled_polls >= STALL_POLLS_REQUIRED:
-                        fp = fingerprint("goal-stalled", tail)
+                        fp = fingerprint("goal-stalled", marker, tail)
                         if fp != watcher.last_fingerprint:
                             watcher.last_fingerprint = fp
                             log(cfg, f"{watcher.surface}: goal footer active but no turn running (stall; observe-only)")
@@ -554,9 +574,10 @@ def main() -> int:
                     # Discovered surface went away (tab closed); drop it.
                     log(cfg, f"discovery: stopped watching {surface} ({exc})")
                     del cfg.watchers[surface]
-        if witnesses_dirty:
+        if witnesses_dirty and time.time() - last_witness_save >= 60:
             save_witnesses(cfg.watchers)
             witnesses_dirty = False
+            last_witness_save = time.time()
         time.sleep(cfg.interval)
 
 

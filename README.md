@@ -30,9 +30,10 @@ error still on screen — is logged as `stale_stop_skipped` and left alone.
 Consequence: a session that dies while the watchdog itself is down stays
 stopped until you resume it once by hand.
 
-Runs gently: three quick attempts per stop (30s/60s/120s apart), then a slow
-lane of one retry every 15 minutes until the storm passes, with a cmux
-notification when it enters the slow lane.
+Runs gently: a dozen fast attempts per stop with exponential backoff
+(5s, 10s, 20s, 40s, then 60s), then a slow lane of one retry every 5 minutes
+until the storm passes — bounded to ~2 hours by the witness freshness window —
+with a cmux notification when it enters the slow lane.
 
 ## Run
 
