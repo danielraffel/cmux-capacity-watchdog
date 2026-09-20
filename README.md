@@ -16,7 +16,11 @@ State-aware resume, evidence-gated:
   (`deliberate_pause_skipped`) and left alone.
 - a "pursuing goal" footer with no running turn is logged as `stall_observed`
   but never acted on: no error signature, no resume.
-- busy turns and sessions with an unsent draft in the composer are never touched
+- busy turns are never touched. An unsent draft in the composer blocks action,
+  with one exception: a draft that **exactly matches** the resume command is
+  submitted with Enter (bounded to 3 attempts) — it is either the watchdog's
+  own orphaned send from before a restart or the user's identical intent, and
+  pressing Enter types nothing new.
 
 Explicit exclusions live in `~/.config/cmux-capacity-watchdog/ignore` (one
 surface UUID or `title:<substring>` per line, reloaded every cycle — edits take

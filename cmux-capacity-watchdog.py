@@ -6,7 +6,10 @@ goal that stopped on a capacity-class error gets "continue". Resume is
 evidence-gated: every action requires a known transient-error signature on
 screen (capacity/overload/stream failure). Sessions that stopped any other way
 — user pause, user interrupt, clean finish, deliberate abandonment — are never
-touched; nor are busy turns or sessions with an unsent draft in the composer.
+touched; nor are busy turns. An unsent draft in the composer blocks action, with
+one exception: a draft that exactly matches the resume command is submitted with
+Enter (it is either our own orphaned send from before a restart or the user's
+identical intent), bounded to a few attempts.
 
 Steady-state polls are cheap (every 5 minutes by default); once a stop is
 detected, the fast retry ladder runs inline at full speed (5s→60s backoff),
@@ -33,7 +36,7 @@ CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-09-19.14"
+WATCHDOG_VERSION = "2026-09-20.1"
 
 # A turn is running when any of these appear in the tail.
 BUSY_MARKERS = ("esc to interrupt",)
@@ -141,6 +144,7 @@ STALL_POLLS_REQUIRED = 2        # an idle "pursuing goal" footer must persist be
 SLOW_LANE_INTERVAL = 300        # after the fast attempts: one retry every 5 min until the storm passes
 CONFIRM_GRACE = 45.0            # never send twice into a slow-starting turn
 VERIFY_WAIT = 4.0
+ORPHAN_ENTER_MAX = 3            # bounded Enter retries for a composer draft that exactly matches the resume command
 
 
 def cmux(*args: str) -> str:
@@ -264,7 +268,9 @@ def fingerprint(state: str, marker: str, tail: str) -> str:
     # ticking timers and rotating reset times read as one stop.
     lines = [line.strip() for line in tail.splitlines() if line.strip()]
     relevant = " | ".join(lines[-2:]).lower()
-    normalized = "".join("#" if c.isdigit() else c for c in relevant)
+    # Braille spinner glyphs (U+2800–U+28FF) churn every frame; like digits,
+    # they must not make one stop read as a new episode on every poll.
+    normalized = "".join("#" if c.isdigit() or 0x2800 <= ord(c) <= 0x28FF else c for c in relevant)
     return hashlib.sha1(f"{state}\n{marker}\n{normalized}".encode()).hexdigest()[:12]
 
 
@@ -283,6 +289,7 @@ class Watcher:
     primed: bool = False    # first observation only records marker state, never acts
     marker_seen: str = ""   # the error marker instance currently on screen
     skip_logged: bool = False  # stale/deliberate skips log once per stop episode
+    orphan_enters: int = 0  # Enter presses on a composer draft that exactly matches the resume command
 
 
 @dataclass
@@ -551,6 +558,7 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
         watcher.pending = None
         watcher.marker_seen = ""
         watcher.skip_logged = False
+        watcher.orphan_enters = 0
     if state in ("goal-paused", "capacity-stopped"):
         # Marker novelty: this exact marker instance was already evaluated
         # within this stop episode and not cleared by a busy turn or one of
@@ -580,6 +588,56 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
     if now < watcher.next_action_at:
         return
     if composer_has_text(tail):
+        content = composer_content(tail)
+        if content == command and watcher.orphan_enters < ORPHAN_ENTER_MAX:
+            # The composer holds exactly the command we would send: either an
+            # orphaned watchdog send from before a restart (pending state is
+            # in-memory and lost) or a matching user draft. Submitting it is
+            # the intended action either way and types nothing new — press
+            # Enter, bounded, instead of deadlocking on the draft forever.
+            watcher.orphan_enters += 1
+            log(cfg, f"{watcher.surface}: composer holds exactly {command!r}; submitting with Enter (orphan attempt {watcher.orphan_enters})")
+            record(cfg, "orphan_enter", surface=watcher.surface, title=watcher.title,
+                   state=state, command=command, attempt=watcher.orphan_enters)
+            try:
+                cmux("send-key", "--surface", watcher.surface, "enter")
+            except Exception as exc:
+                log(cfg, f"{watcher.surface}: orphan Enter failed: {exc}")
+                record(cfg, "send_error", surface=watcher.surface, command=command, error=str(exc))
+                watcher.next_action_at = now + SLOW_LANE_INTERVAL
+                return
+            time.sleep(1.0)
+            # The composer is the witness: if the command still sits there,
+            # Enter did not take and the stop is still standing.
+            if composer_content(read_tail(watcher.surface)) == command:
+                if watcher.orphan_enters >= ORPHAN_ENTER_MAX:
+                    log(cfg, f"{watcher.surface}: Enter never takes on this session; leaving it for a human")
+                    record(cfg, "orphan_enter_gave_up", surface=watcher.surface, title=watcher.title,
+                           command=command)
+                    notify("watchdog: cannot resume a session", f"{watcher.surface}: Enter never takes")
+                else:
+                    log(cfg, f"{watcher.surface}: Enter did not take; will retry")
+                watcher.next_action_at = now + SLOW_LANE_INTERVAL
+                return
+            # The command left the composer: it was submitted. Park a
+            # late-confirmation pending exactly like an ambiguous retry — no
+            # further sends until the turn appears or the window lapses.
+            watcher.pending = {"command": command, "attempt": watcher.actions_on_stop,
+                               "lane": "fast", "sent_at": now, "stop_since": watcher.stop_since}
+            confirmed, _post_state, _post_tail = verify_resumed(watcher.surface)
+            if confirmed:
+                elapsed = round(now - watcher.stop_since, 1) if watcher.stop_since else None
+                log(cfg, f"{watcher.surface}: resumed via orphan Enter, turn is running")
+                record(cfg, "resumed", surface=watcher.surface, title=watcher.title,
+                       command=command, attempt=watcher.actions_on_stop, lane="fast",
+                       since_stop_s=elapsed, via="orphan_enter")
+                watcher.pending = None
+            else:
+                log(cfg, f"{watcher.surface}: command submitted; awaiting the turn (no further sends for this stop)")
+                record(cfg, "submitted_awaiting_turn", surface=watcher.surface, title=watcher.title,
+                       command=command, attempt=watcher.actions_on_stop, via="orphan_enter")
+                watcher.next_action_at = now + SLOW_LANE_INTERVAL
+            return
         log(cfg, f"{watcher.surface}: {state} but composer has unsent text; leaving it alone")
         record(cfg, "composer_blocked", surface=watcher.surface, state=state)
         watcher.next_action_at = now + 60
@@ -709,6 +767,8 @@ def report(stats_file: str) -> int:
     ambiguous = [e for e in events if e.get("event") == "submit_ambiguous"]
     ambiguous_retries = [e for e in events if e.get("event") == "ambiguous_retry"]
     blocked = [e for e in events if e.get("event") == "composer_blocked"]
+    orphans = [e for e in events if e.get("event") == "orphan_enter"]
+    orphan_gave_up = [e for e in events if e.get("event") == "orphan_enter_gave_up"]
     deliberate = [e for e in events if e.get("event") == "deliberate_pause_skipped"]
     stalls = [e for e in events if e.get("event") == "stall_observed"]
     stale = [e for e in events if e.get("event") == "stale_stop_skipped"]
@@ -749,7 +809,7 @@ def report(stats_file: str) -> int:
             mid = len(latencies) // 2
             median = latencies[mid] if len(latencies) % 2 else (latencies[mid - 1] + latencies[mid]) / 2
             print(f"time-to-resume: median {median}s, max {latencies[-1]}s")
-    print(f"composer-blocked deferrals: {len(blocked)}  slow-lane entries: {len(slow)}  deliberate pauses left alone: {len(deliberate)}  stalls observed (never acted on): {len(stalls)}  stale stops skipped (witness rule): {len(stale)}  stale evidence skipped: {len(stale_ev)}  primed-on-stopped: {len(primed)}")
+    print(f"composer-blocked deferrals: {len(blocked)}  orphan Enter submissions: {len(orphans)} (gave up: {len(orphan_gave_up)})  slow-lane entries: {len(slow)}  deliberate pauses left alone: {len(deliberate)}  stalls observed (never acted on): {len(stalls)}  stale stops skipped (witness rule): {len(stale)}  stale evidence skipped: {len(stale_ev)}  primed-on-stopped: {len(primed)}")
 
     # Which error signatures are killing sessions, with one example each —
     # this is how we decide what to add to or tune in the marker list.
@@ -853,6 +913,7 @@ def main() -> int:
                     watcher.actions_on_stop = 0
                     watcher.parked = False
                     watcher.stalled_polls = 0
+                    watcher.orphan_enters = 0
                     witnesses_dirty = True
                     continue
                 if state in ("idle", "goal-stalled-candidate") and watcher.pending:
@@ -886,8 +947,21 @@ def main() -> int:
                     # primed too: otherwise the next identical poll reads as a
                     # "new episode" and the reset would wipe marker_seen,
                     # bypassing this guard entirely.
+                    #
+                    # Scope: this guard exists for sessions with no fresh
+                    # witnessed-busy record — the deliberate-stop case. When
+                    # the witness file proves this session was busy recently
+                    # (e.g. the watchdog was redeployed mid-storm), priming
+                    # would instead dead-letter a live stop forever: the
+                    # primed fingerprint and marker would read as stale on
+                    # every later poll even though the witness rule would
+                    # have let act() resume it. Witness-fresh surfaces fall
+                    # through to act() on first sighting; the evidence gate
+                    # and the witness rule there still apply.
                     watcher.primed = True
-                    if marker:
+                    witnessed_fresh = (watcher.last_seen_busy > 0
+                                       and time.time() - watcher.last_seen_busy <= WITNESS_FRESHNESS)
+                    if marker and not witnessed_fresh:
                         watcher.marker_seen = marker
                         watcher.last_fingerprint = fingerprint(state, marker, tail)
                         log(cfg, f"{watcher.surface}: primed on an already-stopped session ({state}); observing only")
