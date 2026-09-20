@@ -33,7 +33,7 @@ CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-09-19.4"
+WATCHDOG_VERSION = "2026-09-19.5"
 
 # A turn is running when any of these appear in the tail.
 BUSY_MARKERS = ("esc to interrupt",)
@@ -101,6 +101,9 @@ IGNORE_FILE = os.path.expanduser("~/.config/cmux-capacity-watchdog/ignore")
 
 
 def load_ignore_rules() -> tuple:
+    """Return (ids, title_parts, ok). An unreadable ignore file fails CLOSED:
+    exclusions are a safety boundary, so until the file reads again nothing
+    is acted on at all."""
     ids, title_parts = set(), []
     try:
         with open(IGNORE_FILE) as handle:
@@ -113,16 +116,17 @@ def load_ignore_rules() -> tuple:
                 else:
                     ids.add(line)
     except FileNotFoundError:
-        pass
+        pass  # no exclusions configured is a normal state
     except OSError as exc:
-        # An unreadable ignore file means exclusions are not in force — that
-        # fails OPEN, so say so loudly rather than resuming excluded sessions.
-        print(f"WARNING: ignore file unreadable ({exc}); exclusions not in force", flush=True)
-    return ids, title_parts
+        print(f"WARNING: ignore file unreadable ({exc}); failing closed, no resumes until it reads", flush=True)
+        return ids, title_parts, False
+    return ids, title_parts, True
 
 
 def is_ignored(rules, surface: str, title: str) -> bool:
-    ids, title_parts = rules
+    ids, title_parts, ok = rules
+    if not ok:
+        return True
     if surface in ids:
         return True
     lowered = title.lower()
@@ -150,16 +154,40 @@ def read_tail(surface: str, lines: int = 30) -> str:
     return cmux("read-screen", "--surface", surface, "--lines", str(lines))
 
 
+def composer_content(tail: str) -> str:
+    """The text currently in the composer (best-effort, last composer line)."""
+    for line in reversed(tail.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("›"):
+            return stripped.lstrip("›").strip()
+    return ""
+
+
+class ComposerContaminated(Exception):
+    pass
+
+
 def send_literal(surface: str, text: str) -> None:
     """Send control input (slash command or plain prompt) at column zero.
 
     Per the tab-coordination rules: slash commands are client control input and
     must never go through an attributing peer-message path; Enter follows only
-    after the paste-debounce window.
+    after the paste-debounce window — and only when the composer still holds
+    exactly our text. If the user started typing in the gap, our text is
+    backed out when it is a clean suffix, and the send aborts either way.
     """
     cmux("send", "--surface", surface, text)
     time.sleep(1.2)
-    cmux("send-key", "--surface", surface, "enter")
+    content = composer_content(read_tail(surface))
+    if content == text:
+        cmux("send-key", "--surface", surface, "enter")
+        return
+    if content.endswith(text) and len(content) > len(text):
+        # Our text landed after the user's fresh keystrokes; remove exactly
+        # our suffix and leave their draft intact.
+        for _ in range(len(text)):
+            cmux("send-key", "--surface", surface, "backspace")
+    raise ComposerContaminated(f"composer changed around our send ({content[:40]!r}); aborted without Enter")
 
 
 def composer_has_text(tail: str) -> bool:
@@ -175,10 +203,17 @@ def composer_has_text(tail: str) -> bool:
     return False
 
 
+# The current stop's error always sits just above the composer; old errors
+# scroll out of the viewport. Matching against the whole tail would let stale
+# scrollback qualify as evidence for a stop that happened hours later (e.g. a
+# deliberate pause long after a capacity error), so only the last lines count.
+EVIDENCE_LINES = 12
+
+
 def classify(tail: str) -> tuple:
     """Return (state, matched_marker). The marker is recorded in stats so we
     can see which failure signatures dominate and which we miss."""
-    lowered = tail.lower()
+    lowered = "\n".join(tail.splitlines()[-EVIDENCE_LINES:]).lower()
     if any(marker in lowered for marker in BUSY_MARKERS):
         return "busy", ""
     for marker in GOAL_PAUSED_MARKERS:
@@ -240,7 +275,7 @@ class Config:
     log_file: str
     stats_file: str
     watchers: dict = field(default_factory=dict)  # surface -> Watcher
-    ignore_rules: tuple = (set(), [])
+    ignore_rules: tuple = (set(), [], True)
 
 
 def log(cfg: Config, message: str) -> None:
@@ -309,6 +344,12 @@ def send_once(cfg: Config, watcher: Watcher, command: str, state: str, marker: s
     now = time.time()
     try:
         send_literal(watcher.surface, command)
+    except ComposerContaminated as exc:
+        log(cfg, f"{watcher.surface}: {exc}")
+        record(cfg, "composer_race_aborted", surface=watcher.surface, command=command)
+        notify("watchdog: composer race", f"{watcher.surface}: aborted a resume rather than submit a mixed draft")
+        watcher.next_action_at = time.time() + 120
+        return "error"
     except Exception as exc:
         log(cfg, f"{watcher.surface}: send failed: {exc}")
         record(cfg, "send_error", surface=watcher.surface, command=command, error=str(exc))
