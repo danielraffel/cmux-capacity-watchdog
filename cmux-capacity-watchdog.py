@@ -30,17 +30,15 @@ BUSY_MARKERS = ("esc to interrupt",)
 # The goal is paused (Codex/Kimi footer wording).
 GOAL_PAUSED_MARKERS = ("goal paused",)
 # The turn died on a transient provider problem worth retrying. User interrupts
-# (Esc) and clean completions never match these.
+# (Esc) and clean completions never match these. Deliberately narrow: the Codex
+# model-capacity family plus the observed stream disconnect. Grow this list
+# from the excerpts captured in stats, never speculatively.
 CAPACITY_MARKERS = (
     "selected model is at capacity",
     "model is at capacity",
     "server_is_overloaded",
     "servers are currently overloaded",
     "stream disconnected before completion",
-    "stream error",
-    "error: 503",
-    "503 service unavailable",
-    "connection error",
 )
 # Known empty-composer placeholders by client.
 COMPOSER_PLACEHOLDERS = ("ask codex to do anything", "ask kimi", "type a message", "ask anything")
@@ -248,6 +246,7 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
         watcher.next_action_at = 0.0
         watcher.parked = False
         watcher.stop_since = now
+        log(cfg, f"{watcher.surface}: stop detected ({state}), evidence {marker!r}")
         record(cfg, "stop_detected", surface=watcher.surface, title=watcher.title,
                state=state, marker=marker, fingerprint=fp, excerpt=tail_excerpt(tail))
     if now < watcher.next_action_at:
@@ -275,7 +274,7 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
         log(cfg, f"{watcher.surface}: DRY-RUN would send {command!r} (attempt {watcher.actions_on_stop})")
         return
     lane = "fast" if watcher.actions_on_stop <= MAX_ACTIONS_PER_STOP else "slow"
-    log(cfg, f"{watcher.surface}: {state}; sending {command!r} (attempt {watcher.actions_on_stop}, {lane} lane)")
+    log(cfg, f"{watcher.surface}: {state}; sending {command!r} because {marker!r} (attempt {watcher.actions_on_stop}, {lane} lane)")
     record(cfg, "action", surface=watcher.surface, title=watcher.title,
            state=state, marker=marker, command=command, attempt=watcher.actions_on_stop, lane=lane)
     try:
