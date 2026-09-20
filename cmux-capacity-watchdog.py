@@ -33,7 +33,7 @@ CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-09-19.11"
+WATCHDOG_VERSION = "2026-09-19.12"
 
 # A turn is running when any of these appear in the tail.
 BUSY_MARKERS = ("esc to interrupt",)
@@ -431,6 +431,17 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
     now = time.time()
     pending = watcher.pending
     has_evidence = state in ("goal-paused", "capacity-stopped") and marker
+    if pending and not pending.get("ambiguous"):
+        # A command was (probably) submitted and no turn has been confirmed:
+        # this pending is terminal for the stop. Suppress ALL further sends —
+        # even if the visible marker text changes, which the novelty gate
+        # would otherwise read as a new stop — until a busy sighting confirms
+        # the turn or the evidence disappears.
+        if not has_evidence:
+            watcher.pending = None
+            log(cfg, f"{watcher.surface}: evidence gone with a pending submission; clearing it")
+            record(cfg, "pending_cleared_no_evidence", surface=watcher.surface, title=watcher.title)
+        return
     if pending and pending.get("ambiguous") and not has_evidence:
         # The error evidence scrolled away: without a current signature this
         # stop is indistinguishable from a deliberate pause, and the evidence
