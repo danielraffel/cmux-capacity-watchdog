@@ -43,3 +43,12 @@ The point is answering "what do we tune next" from data, not vibes.
 Runs as a LaunchAgent (`com.danielraffel.cmux-capacity-watchdog`) on each
 machine, pointed at this checkout; `~/bin/cmux-capacity-watchdog.py` is a
 symlink here. Update flow: `git pull && launchctl kickstart -k gui/$(id -u)/com.danielraffel.cmux-capacity-watchdog`.
+
+## Known issues
+
+Tracked in GitHub issues. Notably
+[#1](https://github.com/danielraffel/cmux-capacity-watchdog/issues/1):
+deliberately stopped or abandoned sessions can be auto-resumed today; see the
+issue for candidate mitigations (witness-only resumes, freshness windows,
+per-surface caps) and the stats signals that will tell us how real the problem
+is before we pick one.
