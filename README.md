@@ -36,17 +36,20 @@ stopped until you resume it once by hand.
 
 Steady state is cheap: every Codex session is polled once a minute. Polls only
 detect — sends stay time-gated by backoff, confirmation windows, and marker
-novelty, so faster polling never means faster sending. Once a stop is detected
-the watchdog switches to full speed for that surface and works the whole fast
-ladder inline — a dozen attempts with exponential backoff (45s grace floor
-after each unconfirmed send, so a slow-starting turn never gets a duplicate
-piled in) — then a slow lane of one retry every 5 minutes rides out the storm,
-bounded to 8 hours by the witness freshness window (an overnight storm still
-finds the session eligible in the morning).
-Every ladder attempt re-reads the screen first: user typing, a state change,
-or the session starting on its own aborts the ladder immediately. A session
-that only shows busy after the ~16s verify window is still credited as a
-confirmed resume, with the true elapsed time.
+novelty, so faster polling never means faster sending. Recovery is
+round-robin: each visit makes at most one attempt per session, the backoff
+schedule persists per session, and the loop wakes at the earlier of the next
+poll or the earliest due retry — so one storming session never delays
+detection or recovery of the others (the invariant
+`test_cmux_capacity_watchdog.py` proves). The fast lane retries with
+exponential backoff (5s→60s, 45s grace floor after each unconfirmed send, so
+a slow-starting turn never gets a duplicate piled in); after a dozen attempts
+a slow lane of one retry every 5 minutes rides out the storm, bounded to 8
+hours by the witness freshness window (an overnight storm still finds the
+session eligible in the morning). Every visit re-reads the screen first: user
+typing, a state change, or the session starting on its own means no attempt
+happens. A session that only shows busy after the ~16s verify window is still
+credited as a confirmed resume, with the true elapsed time.
 
 ## Run
 

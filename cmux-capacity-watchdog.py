@@ -11,10 +11,11 @@ one exception: a draft that exactly matches the resume command is submitted with
 Enter (it is either our own orphaned send from before a restart or the user's
 identical intent), bounded to a few attempts.
 
-Steady-state polls are cheap (every minute by default); once a stop is
-detected, the fast retry ladder runs inline at full speed (5s→60s backoff),
-then a 5-minute slow lane rides out the storm. Every ladder attempt re-reads
-the screen and aborts on user activity or a state change.
+Steady-state polls are cheap (every minute by default). Recovery is
+round-robin: each visit makes at most one attempt per session, the backoff
+schedule persists per session in next_action_at, and the loop wakes at the
+earlier of the next poll or the earliest due retry — so the fast lane keeps
+its 5s→60s exponential spacing without any session blocking the global scan.
 
 Usage:
     cmux-capacity-watchdog.py --surface <id|ref> [--surface ...] [--interval 300] [--dry-run] [--log FILE]
@@ -36,7 +37,7 @@ CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-09-20.3"
+WATCHDOG_VERSION = "2026-09-20.4"
 
 # A turn is running when any of these appear in the tail.
 BUSY_MARKERS = ("esc to interrupt",)
@@ -409,6 +410,9 @@ def send_once(cfg: Config, watcher: Watcher, command: str, state: str, marker: s
         return "error"
     confirmed, post_state, post_tail = verify_resumed(watcher.surface)
     if confirmed:
+        # Clear any stale pending from an earlier unconfirmed send, or the
+        # next busy sighting would credit it again as a late confirmation.
+        watcher.pending = None
         elapsed = round(now - watcher.stop_since, 1) if watcher.stop_since else None
         log(cfg, f"{watcher.surface}: resumed, turn is running")
         record(cfg, "resumed", surface=watcher.surface, title=watcher.title,
@@ -461,11 +465,18 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
             record(cfg, "pending_cleared_no_evidence", surface=watcher.surface, title=watcher.title)
             return
         if now - pending["sent_at"] < SLOW_LANE_INTERVAL:
-            return
-        watcher.pending = None
-        watcher.marker_seen = ""
-        log(cfg, f"{watcher.surface}: no turn {SLOW_LANE_INTERVAL // 60}m after submission; the stop is retryable again")
-        record(cfg, "pending_expired", surface=watcher.surface, title=watcher.title)
+            if now < watcher.next_action_at:
+                return
+            # A scheduled fast-lane retry is due inside the confirmation
+            # window. The backoff schedule is authoritative here — this
+            # preserves the retry spacing the old inline ladder had — while
+            # the window stays the fallback for submissions with no earlier
+            # retry scheduled (ambiguous sends, orphan Enters, slow lane).
+        else:
+            watcher.pending = None
+            watcher.marker_seen = ""
+            log(cfg, f"{watcher.surface}: no turn {SLOW_LANE_INTERVAL // 60}m after submission; the stop is retryable again")
+            record(cfg, "pending_expired", surface=watcher.surface, title=watcher.title)
     if pending and pending.get("ambiguous") and not has_evidence:
         # The error evidence scrolled away: without a current signature this
         # stop is indistinguishable from a deliberate pause, and the evidence
@@ -656,54 +667,36 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
         log(cfg, f"{watcher.surface}: DRY-RUN would send {command!r} ({lane} lane)")
         return
 
+    # One recovery attempt per visit. The backoff schedule persists in
+    # next_action_at and the main loop wakes at the earliest due timer, so a
+    # session in deep backoff can never delay detection or recovery of the
+    # others. The fast lane keeps the same 5s→60s exponential spacing the old
+    # inline ladder had; after the twelfth attempt the slow lane retries every
+    # 5 minutes until the storm passes.
     if watcher.actions_on_stop >= MAX_ACTIONS_PER_STOP:
-        # Slow lane: one gentle send per poll until the storm passes.
-        if not watcher.parked:
-            watcher.parked = True
-            log(cfg, f"{watcher.surface}: slow lane after {watcher.actions_on_stop} quick attempts; retrying every {SLOW_LANE_INTERVAL // 60}m")
-            record(cfg, "slow_lane", surface=watcher.surface, attempts=watcher.actions_on_stop)
-            notify("watchdog: session in slow lane", f"{watcher.surface} keeps failing to resume")
-        watcher.next_action_at = now + SLOW_LANE_INTERVAL
-        watcher.actions_on_stop += 1
-        send_once(cfg, watcher, command, state, marker, "slow")
+        lane = "slow"
+        backoff = SLOW_LANE_INTERVAL
+    else:
+        lane = "fast"
+        backoff = min(FAST_BACKOFF_CAP, 5 * (2 ** watcher.actions_on_stop))
+    watcher.actions_on_stop += 1
+    outcome = send_once(cfg, watcher, command, state, marker, lane)
+    if outcome in ("confirmed", "error"):
+        # Confirmed: nothing to schedule. Error: the error path already set
+        # its own retry timing (or parked an ambiguous pending).
         return
-
-    # Fast lane: work the whole backoff ladder inline, so a detected stop gets
-    # full-speed retrying even though steady-state polls are minutes apart.
-    # Every attempt re-reads the screen first: a session that starts on its
-    # own, a state change, or the user typing aborts the ladder immediately.
-    while watcher.actions_on_stop < MAX_ACTIONS_PER_STOP:
-        watcher.actions_on_stop += 1
-        outcome = send_once(cfg, watcher, command, state, marker, "fast")
-        if outcome == "confirmed":
-            return
-        if outcome == "error":
-            # A composer race means the user is typing right now; a transport
-            # error means cmux is unhappy. Either way the ladder stops here
-            # and the error path's own retry timing applies.
-            return
-        if watcher.actions_on_stop >= MAX_ACTIONS_PER_STOP:
-            break
-        backoff = min(FAST_BACKOFF_CAP, 5 * (2 ** (watcher.actions_on_stop - 1)))
-        if outcome == "unconfirmed":
-            # Never pile a second send into a slow-starting turn.
-            backoff = max(backoff, CONFIRM_GRACE)
-        time.sleep(backoff)
-        tail = read_tail(watcher.surface)
-        state, marker = classify(tail)
-        if state == "busy":
-            confirm_pending(cfg, watcher)
-            return
-        if state not in ("goal-paused", "capacity-stopped") or composer_has_text(tail):
-            log(cfg, f"{watcher.surface}: stop changed shape mid-ladder (now {state}); pausing ladder")
-            watcher.next_action_at = time.time() + 60
-            return
-    # Ladder spent without a confirmed resume: hand off to the slow lane.
-    watcher.parked = True
-    log(cfg, f"{watcher.surface}: slow lane after {watcher.actions_on_stop} quick attempts; retrying every {SLOW_LANE_INTERVAL // 60}m")
-    record(cfg, "slow_lane", surface=watcher.surface, attempts=watcher.actions_on_stop)
-    notify("watchdog: session in slow lane", f"{watcher.surface} keeps failing to resume")
-    watcher.next_action_at = time.time() + SLOW_LANE_INTERVAL
+    if watcher.actions_on_stop >= MAX_ACTIONS_PER_STOP and not watcher.parked:
+        # The fast ladder is spent without a confirmed resume: from the next
+        # attempt on, ride out the storm at the slow lane's gentler cadence.
+        watcher.parked = True
+        backoff = SLOW_LANE_INTERVAL
+        log(cfg, f"{watcher.surface}: slow lane after {watcher.actions_on_stop} quick attempts; retrying every {SLOW_LANE_INTERVAL // 60}m")
+        record(cfg, "slow_lane", surface=watcher.surface, attempts=watcher.actions_on_stop)
+        notify("watchdog: session in slow lane", f"{watcher.surface} keeps failing to resume")
+    if outcome == "unconfirmed":
+        # Never pile a second send into a slow-starting turn.
+        backoff = max(backoff, CONFIRM_GRACE)
+    watcher.next_action_at = now + backoff
 
 
 def discover_codex_surfaces(cfg: Config, witnesses: dict) -> None:
@@ -872,6 +865,102 @@ def report(stats_file: str) -> int:
     return 0
 
 
+def poll_surface(cfg: Config, watcher: Watcher, pinned: set) -> bool:
+    """One visit to one surface: classify, witness busy turns, act on a stop.
+
+    Never retries inline — backoff lives in next_action_at and the loop wakes
+    at the earliest due timer — so no session can delay the others. Returns
+    True when witnessed-busy state changed and needs persisting.
+    """
+    try:
+        tail = read_tail(watcher.surface)
+        state, marker = classify(tail)
+        if state == "busy":
+            watcher.marker_seen = ""
+            confirm_pending(cfg, watcher)
+            # A running turn proves the last resume worked; re-arm.
+            if watcher.last_seen_busy == 0:
+                record(cfg, "witnessed_busy", surface=watcher.surface, title=watcher.title)
+            watcher.last_seen_busy = time.time()
+            watcher.last_fingerprint = ""
+            watcher.actions_on_stop = 0
+            watcher.parked = False
+            watcher.stalled_polls = 0
+            watcher.orphan_enters = 0
+            return True
+        if state in ("idle", "goal-stalled-candidate") and watcher.pending:
+            # The stop settled without a confirmable turn (a short turn can
+            # complete between polls, or the session was cleaned up): nothing
+            # may suppress a future stop.
+            watcher.pending = None
+            watcher.marker_seen = ""
+            log(cfg, f"{watcher.surface}: session settled ({state}) with a pending submission; clearing it")
+            record(cfg, "pending_cleared_idle", surface=watcher.surface, title=watcher.title, state=state)
+        if state == "goal-stalled-candidate":
+            # Between-turn gaps are seconds; only a persistent idle
+            # "pursuing goal" footer is a real stall. Observe-only:
+            # a stall has no error signature, and we never resume
+            # anything without one — but knowing stalls happen informs
+            # future policy.
+            watcher.stalled_polls += 1
+            if watcher.stalled_polls >= STALL_POLLS_REQUIRED:
+                fp = fingerprint("goal-stalled", marker, tail)
+                if fp != watcher.last_fingerprint:
+                    watcher.last_fingerprint = fp
+                    log(cfg, f"{watcher.surface}: goal footer active but no turn running (stall; observe-only)")
+                    record(cfg, "stall_observed", surface=watcher.surface, title=watcher.title,
+                           fingerprint=fp, excerpt=tail_excerpt(tail))
+            return False
+        watcher.stalled_polls = 0
+        if not watcher.primed:
+            # First sighting of a surface records its full episode state
+            # without acting, so a stop we never saw begin is never mistaken
+            # for a fresh one. The fingerprint must be primed too: otherwise
+            # the next identical poll reads as a "new episode" and the reset
+            # would wipe marker_seen, bypassing this guard entirely.
+            #
+            # Scope: this guard exists for sessions with no fresh
+            # witnessed-busy record — the deliberate-stop case. When the
+            # witness file proves this session was busy recently (e.g. the
+            # watchdog was redeployed mid-storm), priming would instead
+            # dead-letter a live stop forever: the primed fingerprint and
+            # marker would read as stale on every later poll even though the
+            # witness rule would have let act() resume it. Witness-fresh
+            # surfaces fall through to act() on first sighting; the evidence
+            # gate and the witness rule there still apply.
+            watcher.primed = True
+            witnessed_fresh = (watcher.last_seen_busy > 0
+                               and time.time() - watcher.last_seen_busy <= WITNESS_FRESHNESS)
+            if marker and not witnessed_fresh:
+                watcher.marker_seen = marker
+                watcher.last_fingerprint = fingerprint(state, marker, tail)
+                log(cfg, f"{watcher.surface}: primed on an already-stopped session ({state}); observing only")
+                record(cfg, "primed_stopped", surface=watcher.surface, title=watcher.title,
+                       state=state, marker=marker)
+                return False
+        if state in ("goal-paused", "goal-paused-no-error", "capacity-stopped"):
+            act(cfg, watcher, state, tail, marker)
+    except Exception as exc:
+        if watcher.surface in pinned:
+            log(cfg, f"{watcher.surface}: poll error: {exc}")
+        else:
+            # Discovered surface went away (tab closed); drop it.
+            log(cfg, f"discovery: stopped watching {watcher.surface} ({exc})")
+            cfg.watchers.pop(watcher.surface, None)
+    return False
+
+
+def next_wake(cfg: Config) -> float:
+    """Seconds until the next scan: the earlier of the steady-state poll
+    cadence or the earliest scheduled retry, so a session mid fast-lane is
+    retried on its backoff schedule without holding the scan for the others."""
+    now = time.time()
+    due_in = [w.next_action_at - now for w in cfg.watchers.values() if w.next_action_at > now]
+    if not due_in:
+        return cfg.interval
+    return max(1.0, min(cfg.interval, min(due_in)))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--surface", action="append", default=[], help="cmux surface id or ref; repeatable")
@@ -902,95 +991,19 @@ def main() -> int:
     last_discovery = 0.0
     witnesses_dirty = False
     last_witness_save = 0.0
+    pinned = set(args.surface)
     while True:
         cfg.ignore_rules = load_ignore_rules()
         if args.all_codex and time.time() - last_discovery >= DISCOVERY_INTERVAL:
             discover_codex_surfaces(cfg, witnesses)
             last_discovery = time.time()
-        for surface, watcher in list(cfg.watchers.items()):
-            try:
-                tail = read_tail(watcher.surface)
-                state, marker = classify(tail)
-                if state == "busy":
-                    watcher.marker_seen = ""
-                    confirm_pending(cfg, watcher)
-                    # A running turn proves the last resume worked; re-arm.
-                    if watcher.last_seen_busy == 0:
-                        record(cfg, "witnessed_busy", surface=watcher.surface, title=watcher.title)
-                    watcher.last_seen_busy = time.time()
-                    watcher.last_fingerprint = ""
-                    watcher.actions_on_stop = 0
-                    watcher.parked = False
-                    watcher.stalled_polls = 0
-                    watcher.orphan_enters = 0
-                    witnesses_dirty = True
-                    continue
-                if state in ("idle", "goal-stalled-candidate") and watcher.pending:
-                    # The stop settled without a confirmable turn (a short
-                    # turn can complete between 5-minute polls, or the session
-                    # was cleaned up): nothing may suppress a future stop.
-                    watcher.pending = None
-                    watcher.marker_seen = ""
-                    log(cfg, f"{watcher.surface}: session settled ({state}) with a pending submission; clearing it")
-                    record(cfg, "pending_cleared_idle", surface=watcher.surface, title=watcher.title, state=state)
-                if state == "goal-stalled-candidate":
-                    # Between-turn gaps are seconds; only a persistent idle
-                    # "pursuing goal" footer is a real stall. Observe-only:
-                    # a stall has no error signature, and we never resume
-                    # anything without one — but knowing stalls happen informs
-                    # future policy.
-                    watcher.stalled_polls += 1
-                    if watcher.stalled_polls >= STALL_POLLS_REQUIRED:
-                        fp = fingerprint("goal-stalled", marker, tail)
-                        if fp != watcher.last_fingerprint:
-                            watcher.last_fingerprint = fp
-                            log(cfg, f"{watcher.surface}: goal footer active but no turn running (stall; observe-only)")
-                            record(cfg, "stall_observed", surface=watcher.surface, title=watcher.title,
-                                   fingerprint=fp, excerpt=tail_excerpt(tail))
-                    continue
-                watcher.stalled_polls = 0
-                if not watcher.primed:
-                    # First sighting of a surface records its full episode
-                    # state without acting, so a stop we never saw begin is
-                    # never mistaken for a fresh one. The fingerprint must be
-                    # primed too: otherwise the next identical poll reads as a
-                    # "new episode" and the reset would wipe marker_seen,
-                    # bypassing this guard entirely.
-                    #
-                    # Scope: this guard exists for sessions with no fresh
-                    # witnessed-busy record — the deliberate-stop case. When
-                    # the witness file proves this session was busy recently
-                    # (e.g. the watchdog was redeployed mid-storm), priming
-                    # would instead dead-letter a live stop forever: the
-                    # primed fingerprint and marker would read as stale on
-                    # every later poll even though the witness rule would
-                    # have let act() resume it. Witness-fresh surfaces fall
-                    # through to act() on first sighting; the evidence gate
-                    # and the witness rule there still apply.
-                    watcher.primed = True
-                    witnessed_fresh = (watcher.last_seen_busy > 0
-                                       and time.time() - watcher.last_seen_busy <= WITNESS_FRESHNESS)
-                    if marker and not witnessed_fresh:
-                        watcher.marker_seen = marker
-                        watcher.last_fingerprint = fingerprint(state, marker, tail)
-                        log(cfg, f"{watcher.surface}: primed on an already-stopped session ({state}); observing only")
-                        record(cfg, "primed_stopped", surface=watcher.surface, title=watcher.title,
-                               state=state, marker=marker)
-                        continue
-                if state in ("goal-paused", "goal-paused-no-error", "capacity-stopped"):
-                    act(cfg, watcher, state, tail, marker)
-            except Exception as exc:
-                if surface in args.surface:
-                    log(cfg, f"{watcher.surface}: poll error: {exc}")
-                else:
-                    # Discovered surface went away (tab closed); drop it.
-                    log(cfg, f"discovery: stopped watching {surface} ({exc})")
-                    del cfg.watchers[surface]
+        for watcher in list(cfg.watchers.values()):
+            witnesses_dirty = poll_surface(cfg, watcher, pinned) or witnesses_dirty
         if witnesses_dirty and time.time() - last_witness_save >= 60:
             save_witnesses(cfg.watchers)
             witnesses_dirty = False
             last_witness_save = time.time()
-        time.sleep(cfg.interval)
+        time.sleep(next_wake(cfg))
 
 
 if __name__ == "__main__":
