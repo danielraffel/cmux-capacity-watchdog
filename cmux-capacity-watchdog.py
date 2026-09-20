@@ -33,7 +33,7 @@ CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-09-19.13"
+WATCHDOG_VERSION = "2026-09-19.14"
 
 # A turn is running when any of these appear in the tail.
 BUSY_MARKERS = ("esc to interrupt",)
@@ -880,12 +880,16 @@ def main() -> int:
                     continue
                 watcher.stalled_polls = 0
                 if not watcher.primed:
-                    # First sighting of a surface records its marker state
-                    # without acting, so a stop we never saw begin is never
-                    # mistaken for a fresh one.
+                    # First sighting of a surface records its full episode
+                    # state without acting, so a stop we never saw begin is
+                    # never mistaken for a fresh one. The fingerprint must be
+                    # primed too: otherwise the next identical poll reads as a
+                    # "new episode" and the reset would wipe marker_seen,
+                    # bypassing this guard entirely.
                     watcher.primed = True
                     if marker:
                         watcher.marker_seen = marker
+                        watcher.last_fingerprint = fingerprint(state, marker, tail)
                         log(cfg, f"{watcher.surface}: primed on an already-stopped session ({state}); observing only")
                         record(cfg, "primed_stopped", surface=watcher.surface, title=watcher.title,
                                state=state, marker=marker)
