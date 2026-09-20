@@ -33,7 +33,7 @@ CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-09-19.5"
+WATCHDOG_VERSION = "2026-09-19.6"
 
 # A turn is running when any of these appear in the tail.
 BUSY_MARKERS = ("esc to interrupt",)
@@ -180,6 +180,10 @@ def send_literal(surface: str, text: str) -> None:
     time.sleep(1.2)
     content = composer_content(read_tail(surface))
     if content == text:
+        # Residual race: one subprocess call (~100ms) sits between this read
+        # and Enter. cmux has no atomic validate-and-submit; the repair path
+        # below covers the larger pre-read window, and a lost 100ms race at
+        # worst submits a mangled command the client rejects. Accepted.
         cmux("send-key", "--surface", surface, "enter")
         return
     if content.endswith(text) and len(content) > len(text):
@@ -266,6 +270,8 @@ class Watcher:
     stalled_polls: int = 0
     last_seen_busy: float = 0.0
     pending: object = None  # send awaiting late confirmation: {command, attempt, lane, sent_at, stop_since}
+    primed: bool = False    # first observation only records marker state, never acts
+    marker_seen: str = ""   # the error marker instance currently on screen
 
 
 @dataclass
@@ -344,6 +350,9 @@ def send_once(cfg: Config, watcher: Watcher, command: str, state: str, marker: s
     now = time.time()
     try:
         send_literal(watcher.surface, command)
+        # Our send may change the session state; a stop observed after it
+        # counts as new evidence even if the on-screen marker text is identical.
+        watcher.marker_seen = ""
     except ComposerContaminated as exc:
         log(cfg, f"{watcher.surface}: {exc}")
         record(cfg, "composer_race_aborted", surface=watcher.surface, command=command)
@@ -390,6 +399,21 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
                        None if watcher.last_seen_busy == 0 else round(time.time() - watcher.last_seen_busy, 1)),
                    fingerprint=fp, excerpt=tail_excerpt(tail))
         return
+    if state in ("goal-paused", "capacity-stopped"):
+        # Marker novelty: this exact marker instance was already evaluated and
+        # not cleared by a busy turn or one of our sends, so it is stale
+        # scrollback, not a new stop. A deliberate pause under an old error
+        # lands here. (goal-paused-no-error carries a state marker, not
+        # evidence, and is handled below.)
+        if watcher.marker_seen == marker:
+            fp = fingerprint(state, marker, tail)
+            if fp != watcher.last_fingerprint:
+                watcher.last_fingerprint = fp
+                log(cfg, f"{watcher.surface}: {state} but evidence {marker!r} is not new; leaving it")
+                record(cfg, "stale_evidence_skipped", surface=watcher.surface, title=watcher.title,
+                       state=state, marker=marker, fingerprint=fp, excerpt=tail_excerpt(tail))
+            return
+        watcher.marker_seen = marker
     if state == "goal-paused-no-error":
         fp = fingerprint(state, marker, tail)
         if fp != watcher.last_fingerprint:
@@ -540,6 +564,8 @@ def report(stats_file: str) -> int:
     deliberate = [e for e in events if e.get("event") == "deliberate_pause_skipped"]
     stalls = [e for e in events if e.get("event") == "stall_observed"]
     stale = [e for e in events if e.get("event") == "stale_stop_skipped"]
+    stale_ev = [e for e in events if e.get("event") == "stale_evidence_skipped"]
+    primed = [e for e in events if e.get("event") == "primed_stopped"]
     slow = [e for e in events if e.get("event") == "slow_lane"]
 
     print(f"events: {len(events)}  (since {events[0].get('ts', '?')})")
@@ -575,7 +601,7 @@ def report(stats_file: str) -> int:
             mid = len(latencies) // 2
             median = latencies[mid] if len(latencies) % 2 else (latencies[mid - 1] + latencies[mid]) / 2
             print(f"time-to-resume: median {median}s, max {latencies[-1]}s")
-    print(f"composer-blocked deferrals: {len(blocked)}  slow-lane entries: {len(slow)}  deliberate pauses left alone: {len(deliberate)}  stalls observed (never acted on): {len(stalls)}  stale stops skipped (witness rule): {len(stale)}")
+    print(f"composer-blocked deferrals: {len(blocked)}  slow-lane entries: {len(slow)}  deliberate pauses left alone: {len(deliberate)}  stalls observed (never acted on): {len(stalls)}  stale stops skipped (witness rule): {len(stale)}  stale evidence skipped: {len(stale_ev)}  primed-on-stopped: {len(primed)}")
 
     # Which error signatures are killing sessions, with one example each —
     # this is how we decide what to add to or tune in the marker list.
@@ -669,6 +695,7 @@ def main() -> int:
                 tail = read_tail(watcher.surface)
                 state, marker = classify(tail)
                 if state == "busy":
+                    watcher.marker_seen = ""
                     confirm_pending(cfg, watcher)
                     # A running turn proves the last resume worked; re-arm.
                     if watcher.last_seen_busy == 0:
@@ -696,6 +723,17 @@ def main() -> int:
                                    fingerprint=fp, excerpt=tail_excerpt(tail))
                     continue
                 watcher.stalled_polls = 0
+                if not watcher.primed:
+                    # First sighting of a surface records its marker state
+                    # without acting, so a stop we never saw begin is never
+                    # mistaken for a fresh one.
+                    watcher.primed = True
+                    if marker:
+                        watcher.marker_seen = marker
+                        log(cfg, f"{watcher.surface}: primed on an already-stopped session ({state}); observing only")
+                        record(cfg, "primed_stopped", surface=watcher.surface, title=watcher.title,
+                               state=state, marker=marker)
+                        continue
                 if state in ("goal-paused", "goal-paused-no-error", "capacity-stopped"):
                     act(cfg, watcher, state, tail, marker)
             except Exception as exc:
