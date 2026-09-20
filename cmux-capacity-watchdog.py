@@ -27,8 +27,9 @@ CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 
 # A turn is running when any of these appear in the tail.
 BUSY_MARKERS = ("esc to interrupt",)
-# The goal is paused (Codex/Kimi footer wording).
-GOAL_PAUSED_MARKERS = ("goal paused",)
+# The goal is paused. Codex words it "Goal stalled (/goal resume)"; Kimi and
+# others say "goal paused".
+GOAL_PAUSED_MARKERS = ("goal paused", "goal stalled")
 # The turn died on a transient provider problem worth retrying. User interrupts
 # (Esc) and clean completions never match these. Deliberately narrow: the Codex
 # model-capacity family plus the observed stream disconnect. Grow this list
