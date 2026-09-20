@@ -11,7 +11,7 @@ one exception: a draft that exactly matches the resume command is submitted with
 Enter (it is either our own orphaned send from before a restart or the user's
 identical intent), bounded to a few attempts.
 
-Steady-state polls are cheap (every 5 minutes by default); once a stop is
+Steady-state polls are cheap (every minute by default); once a stop is
 detected, the fast retry ladder runs inline at full speed (5s→60s backoff),
 then a 5-minute slow lane rides out the storm. Every ladder attempt re-reads
 the screen and aborts on user activity or a state change.
@@ -36,7 +36,7 @@ CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-09-20.2"
+WATCHDOG_VERSION = "2026-09-20.3"
 
 # A turn is running when any of these appear in the tail.
 BUSY_MARKERS = ("esc to interrupt",)
@@ -647,7 +647,9 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
             return
         log(cfg, f"{watcher.surface}: {state} but composer has unsent text; leaving it alone")
         record(cfg, "composer_blocked", surface=watcher.surface, state=state)
-        watcher.next_action_at = now + 60
+        # Re-check slowly: a user draft can sit for a while, and this keeps the
+        # deferral log at its old 5-minute cadence under a 60s poll.
+        watcher.next_action_at = now + 300
         return
     if cfg.dry_run:
         lane = "fast" if watcher.actions_on_stop < MAX_ACTIONS_PER_STOP else "slow"
@@ -874,7 +876,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--surface", action="append", default=[], help="cmux surface id or ref; repeatable")
     parser.add_argument("--all-codex", action="store_true", help="also discover every Codex session cmux knows about")
-    parser.add_argument("--interval", type=float, default=300.0, help="seconds between steady-state polls (default 300; a detected stop is worked at full speed inline)")
+    parser.add_argument("--interval", type=float, default=60.0, help="seconds between steady-state polls (default 60; sends are time-gated, so faster polls never mean faster sends; a detected stop is worked at full speed inline)")
     parser.add_argument("--dry-run", action="store_true", help="classify and log, never send")
     parser.add_argument("--log", default="", help="append actions to this file")
     parser.add_argument("--stats", default=os.path.expanduser("~/.local/state/cmux-capacity-watchdog.jsonl"),

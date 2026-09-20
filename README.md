@@ -34,13 +34,15 @@ error still on screen — is logged as `stale_stop_skipped` and left alone.
 Consequence: a session that dies while the watchdog itself is down stays
 stopped until you resume it once by hand.
 
-Steady state is cheap: every Codex session is polled once every 5 minutes.
-Once a stop is detected the watchdog switches to full speed for that surface
-and works the whole fast ladder inline — a dozen attempts with exponential
-backoff (45s grace floor after each unconfirmed send, so a slow-starting turn
-never gets a duplicate piled in) — then a slow lane of one retry every 5
-minutes rides out the storm, bounded to 8 hours by the witness freshness
-window (an overnight storm still finds the session eligible in the morning).
+Steady state is cheap: every Codex session is polled once a minute. Polls only
+detect — sends stay time-gated by backoff, confirmation windows, and marker
+novelty, so faster polling never means faster sending. Once a stop is detected
+the watchdog switches to full speed for that surface and works the whole fast
+ladder inline — a dozen attempts with exponential backoff (45s grace floor
+after each unconfirmed send, so a slow-starting turn never gets a duplicate
+piled in) — then a slow lane of one retry every 5 minutes rides out the storm,
+bounded to 8 hours by the witness freshness window (an overnight storm still
+finds the session eligible in the morning).
 Every ladder attempt re-reads the screen first: user typing, a state change,
 or the session starting on its own aborts the ladder immediately. A session
 that only shows busy after the ~16s verify window is still credited as a
