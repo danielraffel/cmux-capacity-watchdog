@@ -8,8 +8,13 @@ screen (capacity/overload/stream failure). Sessions that stopped any other way
 — user pause, user interrupt, clean finish, deliberate abandonment — are never
 touched; nor are busy turns or sessions with an unsent draft in the composer.
 
+Steady-state polls are cheap (every 5 minutes by default); once a stop is
+detected, the fast retry ladder runs inline at full speed (5s→60s backoff),
+then a 5-minute slow lane rides out the storm. Every ladder attempt re-reads
+the screen and aborts on user activity or a state change.
+
 Usage:
-    cmux-capacity-watchdog.py --surface <id|ref> [--surface ...] [--interval 20] [--dry-run] [--log FILE]
+    cmux-capacity-watchdog.py --surface <id|ref> [--surface ...] [--interval 300] [--dry-run] [--log FILE]
 """
 
 import argparse
@@ -277,6 +282,52 @@ def verify_resumed(surface: str) -> tuple:
     return False, state, tail
 
 
+def confirm_pending(cfg: Config, watcher: Watcher) -> None:
+    """A busy sighting after our send confirms the resume, even when the turn
+    took too long to appear inside the verify window."""
+    pending = watcher.pending
+    if not pending:
+        return
+    watcher.pending = None
+    since = round(time.time() - pending["stop_since"], 1) if pending["stop_since"] else None
+    log(cfg, f"{watcher.surface}: resume confirmed late ({int(time.time() - pending['sent_at'])}s after send)")
+    record(cfg, "resumed", surface=watcher.surface, title=watcher.title,
+           command=pending["command"], attempt=pending["attempt"], lane=pending["lane"],
+           since_stop_s=since, late=True)
+
+
+def send_once(cfg: Config, watcher: Watcher, command: str, state: str, marker: str, lane: str) -> str:
+    """Send one resume command and verify. Returns confirmed / unconfirmed / error."""
+    log(cfg, f"{watcher.surface}: {state}; sending {command!r} because {marker!r} (attempt {watcher.actions_on_stop}, {lane} lane)")
+    record(cfg, "action", surface=watcher.surface, title=watcher.title,
+           state=state, marker=marker, command=command, attempt=watcher.actions_on_stop, lane=lane)
+    now = time.time()
+    try:
+        send_literal(watcher.surface, command)
+    except Exception as exc:
+        log(cfg, f"{watcher.surface}: send failed: {exc}")
+        record(cfg, "send_error", surface=watcher.surface, command=command, error=str(exc))
+        return "error"
+    confirmed, post_state, post_tail = verify_resumed(watcher.surface)
+    if confirmed:
+        elapsed = round(now - watcher.stop_since, 1) if watcher.stop_since else None
+        log(cfg, f"{watcher.surface}: resumed, turn is running")
+        record(cfg, "resumed", surface=watcher.surface, title=watcher.title,
+               command=command, attempt=watcher.actions_on_stop, lane=lane, since_stop_s=elapsed)
+        return "confirmed"
+    # The post-attempt screen is the evidence for why a resume missed:
+    # wrong state read, client rejected the command, dialog in the way.
+    log(cfg, f"{watcher.surface}: sent {command!r} but no turn is running (now: {post_state}); will re-check")
+    record(cfg, "resume_unconfirmed", surface=watcher.surface, title=watcher.title,
+           command=command, attempt=watcher.actions_on_stop, lane=lane,
+           post_state=post_state, post_excerpt=tail_excerpt(post_tail))
+    # Codex can take tens of seconds to show a running turn. If the session
+    # goes busy later, that is this send working late — confirm it then.
+    watcher.pending = {"command": command, "attempt": watcher.actions_on_stop,
+                       "lane": lane, "sent_at": now, "stop_since": watcher.stop_since}
+    return "unconfirmed"
+
+
 def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") -> None:
     if is_ignored(cfg.ignore_rules, watcher.surface, watcher.title):
         return
@@ -322,11 +373,13 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
         record(cfg, "composer_blocked", surface=watcher.surface, state=state)
         watcher.next_action_at = now + 60
         return
+    if cfg.dry_run:
+        lane = "fast" if watcher.actions_on_stop < MAX_ACTIONS_PER_STOP else "slow"
+        log(cfg, f"{watcher.surface}: DRY-RUN would send {command!r} ({lane} lane)")
+        return
+
     if watcher.actions_on_stop >= MAX_ACTIONS_PER_STOP:
-        # Fast attempts are spent; drop to the slow lane — one gentle retry
-        # every 5 minutes until the storm passes. The send below still
-        # happens; only the scheduling differs. (An earlier revision returned
-        # here without sending, so the slow lane never actually retried.)
+        # Slow lane: one gentle send per poll until the storm passes.
         if not watcher.parked:
             watcher.parked = True
             log(cfg, f"{watcher.surface}: slow lane after {watcher.actions_on_stop} quick attempts; retrying every {SLOW_LANE_INTERVAL // 60}m")
@@ -334,43 +387,40 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
             notify("watchdog: session in slow lane", f"{watcher.surface} keeps failing to resume")
         watcher.next_action_at = now + SLOW_LANE_INTERVAL
         watcher.actions_on_stop += 1
-        lane = "slow"
-    else:
-        watcher.actions_on_stop += 1
-        backoff = min(FAST_BACKOFF_CAP, 5 * (2 ** (watcher.actions_on_stop - 1)))
-        watcher.next_action_at = now + backoff
-        lane = "fast"
-    if cfg.dry_run:
-        log(cfg, f"{watcher.surface}: DRY-RUN would send {command!r} (attempt {watcher.actions_on_stop}, {lane} lane)")
+        send_once(cfg, watcher, command, state, marker, "slow")
         return
-    log(cfg, f"{watcher.surface}: {state}; sending {command!r} because {marker!r} (attempt {watcher.actions_on_stop}, {lane} lane)")
-    record(cfg, "action", surface=watcher.surface, title=watcher.title,
-           state=state, marker=marker, command=command, attempt=watcher.actions_on_stop, lane=lane)
-    try:
-        send_literal(watcher.surface, command)
-        confirmed, post_state, post_tail = verify_resumed(watcher.surface)
-        if confirmed:
-            elapsed = round(now - watcher.stop_since, 1) if watcher.stop_since else None
-            log(cfg, f"{watcher.surface}: resumed, turn is running")
-            record(cfg, "resumed", surface=watcher.surface, title=watcher.title,
-                   command=command, attempt=watcher.actions_on_stop, lane=lane, since_stop_s=elapsed)
-        else:
-            # The post-attempt screen is the evidence for why a resume missed:
-            # wrong state read, client rejected the command, dialog in the way.
-            log(cfg, f"{watcher.surface}: sent {command!r} but no turn is running (now: {post_state}); will re-check")
-            record(cfg, "resume_unconfirmed", surface=watcher.surface, title=watcher.title,
-                   command=command, attempt=watcher.actions_on_stop, lane=lane,
-                   post_state=post_state, post_excerpt=tail_excerpt(post_tail))
-            # Codex can take tens of seconds to show a running turn. If the
-            # session goes busy later, that is this send working late —
-            # confirm it then, and until then never send again into a
-            # possibly-slow start.
-            watcher.pending = {"command": command, "attempt": watcher.actions_on_stop,
-                               "lane": lane, "sent_at": now, "stop_since": watcher.stop_since}
-            watcher.next_action_at = max(watcher.next_action_at, time.time() + CONFIRM_GRACE)
-    except Exception as exc:
-        log(cfg, f"{watcher.surface}: send failed: {exc}")
-        record(cfg, "send_error", surface=watcher.surface, command=command, error=str(exc))
+
+    # Fast lane: work the whole backoff ladder inline, so a detected stop gets
+    # full-speed retrying even though steady-state polls are minutes apart.
+    # Every attempt re-reads the screen first: a session that starts on its
+    # own, a state change, or the user typing aborts the ladder immediately.
+    while watcher.actions_on_stop < MAX_ACTIONS_PER_STOP:
+        watcher.actions_on_stop += 1
+        outcome = send_once(cfg, watcher, command, state, marker, "fast")
+        if outcome == "confirmed":
+            return
+        if watcher.actions_on_stop >= MAX_ACTIONS_PER_STOP:
+            break
+        backoff = min(FAST_BACKOFF_CAP, 5 * (2 ** (watcher.actions_on_stop - 1)))
+        if outcome == "unconfirmed":
+            # Never pile a second send into a slow-starting turn.
+            backoff = max(backoff, CONFIRM_GRACE)
+        time.sleep(backoff)
+        tail = read_tail(watcher.surface)
+        state, marker = classify(tail)
+        if state == "busy":
+            confirm_pending(cfg, watcher)
+            return
+        if state not in ("goal-paused", "capacity-stopped") or composer_has_text(tail):
+            log(cfg, f"{watcher.surface}: stop changed shape mid-ladder (now {state}); pausing ladder")
+            watcher.next_action_at = time.time() + 60
+            return
+    # Ladder spent without a confirmed resume: hand off to the slow lane.
+    watcher.parked = True
+    log(cfg, f"{watcher.surface}: slow lane after {watcher.actions_on_stop} quick attempts; retrying every {SLOW_LANE_INTERVAL // 60}m")
+    record(cfg, "slow_lane", surface=watcher.surface, attempts=watcher.actions_on_stop)
+    notify("watchdog: session in slow lane", f"{watcher.surface} keeps failing to resume")
+    watcher.next_action_at = time.time() + SLOW_LANE_INTERVAL
 
 
 def discover_codex_surfaces(cfg: Config, witnesses: dict) -> None:
@@ -524,7 +574,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--surface", action="append", default=[], help="cmux surface id or ref; repeatable")
     parser.add_argument("--all-codex", action="store_true", help="also discover every Codex session cmux knows about")
-    parser.add_argument("--interval", type=float, default=20.0)
+    parser.add_argument("--interval", type=float, default=300.0, help="seconds between steady-state polls (default 300; a detected stop is worked at full speed inline)")
     parser.add_argument("--dry-run", action="store_true", help="classify and log, never send")
     parser.add_argument("--log", default="", help="append actions to this file")
     parser.add_argument("--stats", default=os.path.expanduser("~/.local/state/cmux-capacity-watchdog.jsonl"),
@@ -555,17 +605,7 @@ def main() -> int:
                 tail = read_tail(watcher.surface)
                 state, marker = classify(tail)
                 if state == "busy":
-                    # A running turn after our send confirms the resume, even
-                    # when the turn took too long to appear inside the verify
-                    # window; record it with the true elapsed time.
-                    if watcher.pending:
-                        pending = watcher.pending
-                        watcher.pending = None
-                        since = round(time.time() - pending["stop_since"], 1) if pending["stop_since"] else None
-                        log(cfg, f"{watcher.surface}: resume confirmed late ({int(time.time() - pending['sent_at'])}s after send)")
-                        record(cfg, "resumed", surface=watcher.surface, title=watcher.title,
-                               command=pending["command"], attempt=pending["attempt"], lane=pending["lane"],
-                               since_stop_s=since, late=True)
+                    confirm_pending(cfg, watcher)
                     # A running turn proves the last resume worked; re-arm.
                     if watcher.last_seen_busy == 0:
                         record(cfg, "witnessed_busy", surface=watcher.surface, title=watcher.title)
