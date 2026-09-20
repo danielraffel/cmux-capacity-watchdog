@@ -23,7 +23,7 @@ surface UUID or `title:<substring>` per line, reloaded every cycle — edits tak
 effect immediately, no restart).
 
 Witness rule: a stop is only resume-eligible when the watchdog personally saw
-the session busy within the last 2 hours (persisted across restarts in
+the session busy within the last 8 hours (persisted across restarts in
 `~/.local/state/cmux-capacity-watchdog-witness.json`). A session discovered
 already stopped — the classic deliberately-abandoned tab with an old capacity
 error still on screen — is logged as `stale_stop_skipped` and left alone.
@@ -32,8 +32,12 @@ stopped until you resume it once by hand.
 
 Runs gently: a dozen fast attempts per stop with exponential backoff
 (5s, 10s, 20s, 40s, then 60s), then a slow lane of one retry every 5 minutes
-until the storm passes — bounded to ~2 hours by the witness freshness window —
-with a cmux notification when it enters the slow lane.
+until the storm passes — bounded to 8 hours by the witness freshness window,
+so an overnight storm is ridden out — with a cmux notification when it enters
+the slow lane. After each send the turn's appearance is watched for ~16s; a
+session that only shows busy later is still credited as a confirmed resume
+(with the true elapsed time), and a 45s grace floor means a slow-starting
+turn never gets a second send piled into it.
 
 ## Run
 

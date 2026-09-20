@@ -53,7 +53,9 @@ DISCOVERY_INTERVAL = 300.0  # seconds between scans for new Codex sessions
 # busy recently — a transition it witnessed. A session discovered already
 # stopped (typical for deliberately abandoned tabs whose tails still show an
 # old capacity error) is skipped. Witnessed-busy times persist across restarts.
-WITNESS_FRESHNESS = 2 * 3600  # seconds since last seen busy
+# 8 hours: a full night's sleep, so an overnight storm still finds the session
+# resume-eligible in the morning.
+WITNESS_FRESHNESS = 8 * 3600  # seconds since last seen busy
 WITNESS_FILE = os.path.expanduser("~/.local/state/cmux-capacity-watchdog-witness.json")
 
 
@@ -123,6 +125,7 @@ MAX_ACTIONS_PER_STOP = 12
 FAST_BACKOFF_CAP = 60           # seconds
 STALL_POLLS_REQUIRED = 2        # an idle "pursuing goal" footer must persist before acting
 SLOW_LANE_INTERVAL = 300        # after the fast attempts: one retry every 5 min until the storm passes
+CONFIRM_GRACE = 45.0            # never send twice into a slow-starting turn
 VERIFY_WAIT = 4.0
 
 
@@ -217,6 +220,7 @@ class Watcher:
     stop_since: float = 0.0
     stalled_polls: int = 0
     last_seen_busy: float = 0.0
+    pending: object = None  # send awaiting late confirmation: {command, attempt, lane, sent_at, stop_since}
 
 
 @dataclass
@@ -258,11 +262,14 @@ def notify(title: str, body: str) -> None:
 
 
 def verify_resumed(surface: str) -> tuple:
-    """Check a few times over ~10s whether a turn started; return (confirmed,
-    post-state, post-tail) so failures keep their evidence."""
+    """Check over ~16s whether a turn started; return (confirmed, post-state,
+    post-tail) so failures keep their evidence. Codex can take well over a few
+    seconds to show a running turn after /goal resume — a short window here
+    mislabels successful resumes as unconfirmed (harmless for safety: the next
+    poll sees the busy marker and re-arms, but it poisons the stats)."""
     state, tail = "", ""
-    for attempt in range(3):
-        time.sleep(VERIFY_WAIT if attempt == 0 else 3.0)
+    for attempt in range(4):
+        time.sleep(VERIFY_WAIT)
         tail = read_tail(surface)
         state, _ = classify(tail)
         if state == "busy":
@@ -304,6 +311,7 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
         watcher.next_action_at = 0.0
         watcher.parked = False
         watcher.stop_since = now
+        watcher.pending = None
         log(cfg, f"{watcher.surface}: stop detected ({state}), evidence {marker!r}")
         record(cfg, "stop_detected", surface=watcher.surface, title=watcher.title,
                state=state, marker=marker, fingerprint=fp, excerpt=tail_excerpt(tail))
@@ -353,6 +361,13 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
             record(cfg, "resume_unconfirmed", surface=watcher.surface, title=watcher.title,
                    command=command, attempt=watcher.actions_on_stop, lane=lane,
                    post_state=post_state, post_excerpt=tail_excerpt(post_tail))
+            # Codex can take tens of seconds to show a running turn. If the
+            # session goes busy later, that is this send working late —
+            # confirm it then, and until then never send again into a
+            # possibly-slow start.
+            watcher.pending = {"command": command, "attempt": watcher.actions_on_stop,
+                               "lane": lane, "sent_at": now, "stop_since": watcher.stop_since}
+            watcher.next_action_at = max(watcher.next_action_at, time.time() + CONFIRM_GRACE)
     except Exception as exc:
         log(cfg, f"{watcher.surface}: send failed: {exc}")
         record(cfg, "send_error", surface=watcher.surface, command=command, error=str(exc))
@@ -441,7 +456,8 @@ def report(stats_file: str) -> int:
     print(f"resume actions: {len(actions)}  "
           f"(goal resume: {sum(1 for e in actions if e.get('command') == '/goal resume')}, "
           f"continue: {sum(1 for e in actions if e.get('command') == 'continue')})")
-    print(f"resumed OK: {len(resumed)}  unconfirmed: {len(unconfirmed)}  send errors: {len(send_errors)}")
+    late = sum(1 for e in resumed if e.get("late"))
+    print(f"resumed OK: {len(resumed)} ({late} confirmed late)  unconfirmed: {len(unconfirmed)}  send errors: {len(send_errors)}")
     if resumed:
         attempts = sorted(e.get("attempt", 0) for e in resumed)
         latencies = sorted(e.get("since_stop_s") for e in resumed if e.get("since_stop_s") is not None)
@@ -539,6 +555,17 @@ def main() -> int:
                 tail = read_tail(watcher.surface)
                 state, marker = classify(tail)
                 if state == "busy":
+                    # A running turn after our send confirms the resume, even
+                    # when the turn took too long to appear inside the verify
+                    # window; record it with the true elapsed time.
+                    if watcher.pending:
+                        pending = watcher.pending
+                        watcher.pending = None
+                        since = round(time.time() - pending["stop_since"], 1) if pending["stop_since"] else None
+                        log(cfg, f"{watcher.surface}: resume confirmed late ({int(time.time() - pending['sent_at'])}s after send)")
+                        record(cfg, "resumed", surface=watcher.surface, title=watcher.title,
+                               command=pending["command"], attempt=pending["attempt"], lane=pending["lane"],
+                               since_stop_s=since, late=True)
                     # A running turn proves the last resume worked; re-arm.
                     if watcher.last_seen_busy == 0:
                         record(cfg, "witnessed_busy", surface=watcher.surface, title=watcher.title)
