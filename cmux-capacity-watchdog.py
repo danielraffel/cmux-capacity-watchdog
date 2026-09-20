@@ -282,6 +282,7 @@ class Watcher:
     pending: object = None  # send awaiting late confirmation: {command, attempt, lane, sent_at, stop_since}
     primed: bool = False    # first observation only records marker state, never acts
     marker_seen: str = ""   # the error marker instance currently on screen
+    skip_logged: bool = False  # stale/deliberate skips log once per stop episode
 
 
 @dataclass
@@ -433,21 +434,31 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
     has_evidence = state in ("goal-paused", "capacity-stopped") and marker
     if pending and not pending.get("ambiguous"):
         # A command was (probably) submitted and no turn has been confirmed:
-        # this pending is terminal for the stop. Suppress ALL further sends —
+        # suppress ALL further sends while the confirmation window is open —
         # even if the visible marker text changes, which the novelty gate
-        # would otherwise read as a new stop — until a busy sighting confirms
-        # the turn or the evidence disappears.
+        # would otherwise read as a new stop. A busy sighting confirms the
+        # turn; evidence disappearing ends the episode; and if the window
+        # lapses with no turn, the submission conclusively did not take, so
+        # the stop becomes retryable again (the slow lane's whole job).
         if not has_evidence:
             watcher.pending = None
+            watcher.marker_seen = ""
             log(cfg, f"{watcher.surface}: evidence gone with a pending submission; clearing it")
             record(cfg, "pending_cleared_no_evidence", surface=watcher.surface, title=watcher.title)
-        return
+            return
+        if now - pending["sent_at"] < SLOW_LANE_INTERVAL:
+            return
+        watcher.pending = None
+        watcher.marker_seen = ""
+        log(cfg, f"{watcher.surface}: no turn {SLOW_LANE_INTERVAL // 60}m after submission; the stop is retryable again")
+        record(cfg, "pending_expired", surface=watcher.surface, title=watcher.title)
     if pending and pending.get("ambiguous") and not has_evidence:
         # The error evidence scrolled away: without a current signature this
         # stop is indistinguishable from a deliberate pause, and the evidence
         # gate outranks the pending retry. Drop it. (goal-paused-no-error
         # carries a state marker, not evidence.)
         watcher.pending = None
+        watcher.marker_seen = ""
         log(cfg, f"{watcher.surface}: error evidence gone; dropping the ambiguous retry")
         record(cfg, "ambiguous_abandoned", surface=watcher.surface, title=watcher.title)
     if pending and pending.get("ambiguous") and has_evidence:
@@ -526,40 +537,43 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
         watcher.next_action_at = now + SLOW_LANE_INTERVAL
         return
 
-    if state in ("goal-paused", "capacity-stopped"):
-        # Marker novelty: this exact marker instance was already evaluated and
-        # not cleared by a busy turn or one of our sends, so it is stale
-        # scrollback, not a new stop. A deliberate pause under an old error
-        # lands here. (goal-paused-no-error carries a state marker, not
-        # evidence, and is handled below.)
-        if watcher.marker_seen == marker:
-            fp = fingerprint(state, marker, tail)
-            if fp != watcher.last_fingerprint:
-                watcher.last_fingerprint = fp
-                log(cfg, f"{watcher.surface}: {state} but evidence {marker!r} is not new; leaving it")
-                record(cfg, "stale_evidence_skipped", surface=watcher.surface, title=watcher.title,
-                       state=state, marker=marker, fingerprint=fp, excerpt=tail_excerpt(tail))
-            return
-        watcher.marker_seen = marker
-    if state == "goal-paused-no-error":
-        fp = fingerprint(state, marker, tail)
-        if fp != watcher.last_fingerprint:
-            watcher.last_fingerprint = fp
-            log(cfg, f"{watcher.surface}: goal paused without an error on screen; deliberate pause, leaving it")
-            record(cfg, "deliberate_pause_skipped", surface=watcher.surface, title=watcher.title,
-                   fingerprint=fp, excerpt=tail_excerpt(tail))
-        return
-    command = "continue" if state == "capacity-stopped" else "/goal resume"
-    now = time.time()
     fp = fingerprint(state, marker, tail)
-    if fp != watcher.last_fingerprint:
-        # A new stop (or the first one seen): reset the per-stop bookkeeping.
+    new_episode = fp != watcher.last_fingerprint
+    if new_episode:
+        # A new stop episode: reset the per-stop bookkeeping. The episode
+        # boundary re-arms marker novelty too — the same marker text on a
+        # differently-shaped screen is a different stop.
         watcher.last_fingerprint = fp
         watcher.actions_on_stop = 0
         watcher.next_action_at = 0.0
         watcher.parked = False
         watcher.stop_since = now
         watcher.pending = None
+        watcher.marker_seen = ""
+        watcher.skip_logged = False
+    if state in ("goal-paused", "capacity-stopped"):
+        # Marker novelty: this exact marker instance was already evaluated
+        # within this stop episode and not cleared by a busy turn or one of
+        # our sends, so it is stale scrollback, not a new stop. A deliberate
+        # pause under an old error lands here. (goal-paused-no-error carries
+        # a state marker, not evidence, and is handled below.)
+        if watcher.marker_seen == marker:
+            if not watcher.skip_logged:
+                watcher.skip_logged = True
+                log(cfg, f"{watcher.surface}: {state} but evidence {marker!r} is not new; leaving it")
+                record(cfg, "stale_evidence_skipped", surface=watcher.surface, title=watcher.title,
+                       state=state, marker=marker, fingerprint=fp, excerpt=tail_excerpt(tail))
+            return
+        watcher.marker_seen = marker
+    if state == "goal-paused-no-error":
+        if not watcher.skip_logged:
+            watcher.skip_logged = True
+            log(cfg, f"{watcher.surface}: goal paused without an error on screen; deliberate pause, leaving it")
+            record(cfg, "deliberate_pause_skipped", surface=watcher.surface, title=watcher.title,
+                   fingerprint=fp, excerpt=tail_excerpt(tail))
+        return
+    command = "continue" if state == "capacity-stopped" else "/goal resume"
+    if new_episode:
         log(cfg, f"{watcher.surface}: stop detected ({state}), evidence {marker!r}")
         record(cfg, "stop_detected", surface=watcher.surface, title=watcher.title,
                state=state, marker=marker, fingerprint=fp, excerpt=tail_excerpt(tail))
@@ -846,6 +860,7 @@ def main() -> int:
                     # turn can complete between 5-minute polls, or the session
                     # was cleaned up): nothing may suppress a future stop.
                     watcher.pending = None
+                    watcher.marker_seen = ""
                     log(cfg, f"{watcher.surface}: session settled ({state}) with a pending submission; clearing it")
                     record(cfg, "pending_cleared_idle", surface=watcher.surface, title=watcher.title, state=state)
                 if state == "goal-stalled-candidate":
