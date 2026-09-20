@@ -33,7 +33,7 @@ CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-09-19.9"
+WATCHDOG_VERSION = "2026-09-19.10"
 
 # A turn is running when any of these appear in the tail.
 BUSY_MARKERS = ("esc to interrupt",)
@@ -430,7 +430,16 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
         return
     now = time.time()
     pending = watcher.pending
-    if pending and pending.get("ambiguous"):
+    has_evidence = state in ("goal-paused", "capacity-stopped") and marker
+    if pending and pending.get("ambiguous") and not has_evidence:
+        # The error evidence scrolled away: without a current signature this
+        # stop is indistinguishable from a deliberate pause, and the evidence
+        # gate outranks the pending retry. Drop it. (goal-paused-no-error
+        # carries a state marker, not evidence.)
+        watcher.pending = None
+        log(cfg, f"{watcher.surface}: error evidence gone; dropping the ambiguous retry")
+        record(cfg, "ambiguous_abandoned", surface=watcher.surface, title=watcher.title)
+    if pending and pending.get("ambiguous") and has_evidence:
         # An earlier send may or may not have submitted. The composer resolves
         # it: our command sitting there untouched means Enter never landed and
         # pressing it now submits exactly our own command; a cleared composer
@@ -450,7 +459,28 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
                 record(cfg, "send_error", surface=watcher.surface, command=pending["command"], error=str(exc))
                 watcher.next_action_at = now + SLOW_LANE_INTERVAL
                 return
-            watcher.pending = None
+            time.sleep(1.0)
+            # The composer is the witness again: if our command still sits
+            # there, Enter did not take and the stop is still ambiguous.
+            if composer_content(read_tail(watcher.surface)) == pending["command"]:
+                pending["retries"] = pending.get("retries", 0) + 1
+                if pending["retries"] >= 3:
+                    log(cfg, f"{watcher.surface}: Enter never takes on this session; leaving it for a human")
+                    record(cfg, "ambiguous_gave_up", surface=watcher.surface, title=watcher.title,
+                           command=pending["command"])
+                    notify("watchdog: cannot resume a session", f"{watcher.surface}: Enter never takes")
+                    watcher.pending = None
+                    watcher.next_action_at = now + SLOW_LANE_INTERVAL
+                    return
+                log(cfg, f"{watcher.surface}: Enter did not take; will retry")
+                watcher.next_action_at = now + SLOW_LANE_INTERVAL
+                return
+            # The command left the composer: it was submitted. Keep a
+            # late-confirmation pending and do NOT send again — a duplicate is
+            # worse than waiting for the turn to appear.
+            watcher.pending = {"command": pending["command"], "attempt": pending["attempt"],
+                               "lane": pending["lane"], "sent_at": now,
+                               "stop_since": pending["stop_since"]}
             confirmed, post_state, _post_tail = verify_resumed(watcher.surface)
             if confirmed:
                 elapsed = round(now - pending["stop_since"], 1) if pending["stop_since"] else None
@@ -458,10 +488,12 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
                 record(cfg, "resumed", surface=watcher.surface, title=watcher.title,
                        command=pending["command"], attempt=pending["attempt"], lane=pending["lane"],
                        since_stop_s=elapsed)
+                watcher.pending = None
                 return
-            # Still stopped: re-arm the marker so normal retries can proceed.
-            watcher.marker_seen = ""
-            watcher.next_action_at = time.time() + SLOW_LANE_INTERVAL
+            log(cfg, f"{watcher.surface}: command submitted; awaiting the turn (no further sends for this stop)")
+            record(cfg, "submitted_awaiting_turn", surface=watcher.surface, title=watcher.title,
+                   command=pending["command"], attempt=pending["attempt"])
+            watcher.next_action_at = now + SLOW_LANE_INTERVAL
             return
         if composer_has_text(tail):
             log(cfg, f"{watcher.surface}: ambiguous send plus user text in the composer; deferring to the human")
