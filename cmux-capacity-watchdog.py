@@ -37,7 +37,7 @@ CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-09-20.4"
+WATCHDOG_VERSION = "2026-09-20.5"
 
 # A turn is running when any of these appear in the tail.
 BUSY_MARKERS = ("esc to interrupt",)
@@ -601,8 +601,12 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
     command = "continue" if state == "capacity-stopped" else "/goal resume"
     if new_episode:
         log(cfg, f"{watcher.surface}: stop detected ({state}), evidence {marker!r}")
+        # since_busy_s approximates detection lag: the last busy sighting is at
+        # most one scan old while a turn runs, so a large value means detection
+        # itself was delayed — the signal round-robin scheduling exists to fix.
         record(cfg, "stop_detected", surface=watcher.surface, title=watcher.title,
-               state=state, marker=marker, fingerprint=fp, excerpt=tail_excerpt(tail))
+               state=state, marker=marker, fingerprint=fp, excerpt=tail_excerpt(tail),
+               since_busy_s=round(now - watcher.last_seen_busy, 1) if watcher.last_seen_busy else None)
     if now < watcher.next_action_at:
         return
     if composer_has_text(tail):
@@ -813,6 +817,23 @@ def report(stats_file: str) -> int:
             print(f"time-to-resume: median {median}s, max {latencies[-1]}s")
     print(f"composer-blocked deferrals: {len(blocked)}  orphan Enter submissions: {len(orphans)} (gave up: {len(orphan_gave_up)})  slow-lane entries: {len(slow)}  deliberate pauses left alone: {len(deliberate)}  stalls observed (never acted on): {len(stalls)}  stale stops skipped (witness rule): {len(stale)}  stale evidence skipped: {len(stale_ev)}  primed-on-stopped: {len(primed)}")
 
+    # Detection lag (last busy sighting -> stop detected) and scan health:
+    # the numbers that show whether round-robin scheduling keeps every
+    # session's detection fast even while others are storming.
+    lag = sorted(e["since_busy_s"] for e in stops if e.get("since_busy_s") is not None)
+    if lag:
+        mid = len(lag) // 2
+        median = lag[mid] if len(lag) % 2 else (lag[mid - 1] + lag[mid]) / 2
+        print(f"detection lag: median {median}s, max {lag[-1]}s")
+    scans = [e for e in events if e.get("event") == "scan_completed"]
+    if scans:
+        durations = sorted(e.get("duration_s", 0.0) for e in scans)
+        wakes = sorted(e.get("wake_s", 0.0) for e in scans)
+        mid = len(durations) // 2
+        med_d = durations[mid] if len(durations) % 2 else (durations[mid - 1] + durations[mid]) / 2
+        med_w = wakes[mid] if len(wakes) % 2 else (wakes[mid - 1] + wakes[mid]) / 2
+        print(f"scans: {len(scans)}  duration median {med_d}s, max {durations[-1]}s  wake median {med_w}s, min {wakes[0]}s")
+
     # Which error signatures are killing sessions, with one example each —
     # this is how we decide what to add to or tune in the marker list.
     by_marker = {}
@@ -993,6 +1014,7 @@ def main() -> int:
     last_witness_save = 0.0
     pinned = set(args.surface)
     while True:
+        scan_started = time.time()
         cfg.ignore_rules = load_ignore_rules()
         if args.all_codex and time.time() - last_discovery >= DISCOVERY_INTERVAL:
             discover_codex_surfaces(cfg, witnesses)
@@ -1003,7 +1025,13 @@ def main() -> int:
             save_witnesses(cfg.watchers)
             witnesses_dirty = False
             last_witness_save = time.time()
-        time.sleep(next_wake(cfg))
+        wake_in = next_wake(cfg)
+        # Scan telemetry: how long a full visit of every surface took and how
+        # the wake scheduler responded — the data that shows whether scans
+        # keep up and whether a storm actually shortens wake intervals.
+        record(cfg, "scan_completed", surfaces=len(cfg.watchers),
+               duration_s=round(time.time() - scan_started, 1), wake_s=round(wake_in, 1))
+        time.sleep(wake_in)
 
 
 if __name__ == "__main__":

@@ -127,6 +127,20 @@ class RoundRobinTest(unittest.TestCase):
         self.assertAlmostEqual(watcher.next_action_at - time.time(),
                                watchdog.SLOW_LANE_INTERVAL, delta=2.0)
 
+    def test_stop_detected_records_detection_lag(self):
+        """stop_detected carries since_busy_s so detection lag is measurable."""
+        events = []
+        watcher = make_watcher("F")
+        cfg = make_cfg()
+        cfg.watchers = {"F": watcher}
+        with mock.patch.object(watchdog, "read_tail", return_value=STOPPED_TAIL), \
+             mock.patch.object(watchdog, "record",
+                               lambda cfg, event, **fields: events.append({"event": event, **fields})):
+            watchdog.poll_surface(cfg, watcher, pinned=set())
+        detected = [e for e in events if e["event"] == "stop_detected"]
+        self.assertEqual(len(detected), 1)
+        self.assertAlmostEqual(detected[0]["since_busy_s"], 0.0, delta=2.0)
+
     def test_next_wake_earliest_due(self):
         now = time.time()
         cfg = make_cfg()
