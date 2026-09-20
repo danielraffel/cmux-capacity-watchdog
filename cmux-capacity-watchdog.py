@@ -2,8 +2,11 @@
 """Watch cmux agent sessions and resume ones that stopped on provider-capacity errors.
 
 State-aware: a session whose goal paused gets "/goal resume"; a session with no
-goal that stopped on a capacity-class error gets "continue". Sessions that are
-busy, that stopped cleanly, or whose composer has unsent text are never touched.
+goal that stopped on a capacity-class error gets "continue". Resume is
+evidence-gated: every action requires a known transient-error signature on
+screen (capacity/overload/stream failure). Sessions that stopped any other way
+— user pause, user interrupt, clean finish, deliberate abandonment — are never
+touched; nor are busy turns or sessions with an unsent draft in the composer.
 
 Usage:
     cmux-capacity-watchdog.py --surface <id|ref> [--surface ...] [--interval 20] [--dry-run] [--log FILE]
@@ -46,6 +49,37 @@ COMPOSER_PLACEHOLDERS = ("ask codex to do anything", "ask kimi", "type a message
 # slug is visible. Works on busy turns too — the placeholder stays on screen.
 CODEX_SESSION_MARKERS = ("ask codex to do anything", "gpt-")
 DISCOVERY_INTERVAL = 300.0  # seconds between scans for new Codex sessions
+
+# Sessions that must never be touched: one rule per line in the ignore file.
+# A bare line matches a surface UUID; "title:<text>" matches a title substring
+# (case-insensitive). Read on every cycle, so edits take effect immediately —
+# deliberately stopped sessions stay stopped.
+IGNORE_FILE = os.path.expanduser("~/.config/cmux-capacity-watchdog/ignore")
+
+
+def load_ignore_rules() -> tuple:
+    ids, title_parts = set(), []
+    try:
+        with open(IGNORE_FILE) as handle:
+            for line in handle:
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                if line.lower().startswith("title:"):
+                    title_parts.append(line[len("title:"):].strip().lower())
+                else:
+                    ids.add(line)
+    except OSError:
+        pass
+    return ids, title_parts
+
+
+def is_ignored(rules, surface: str, title: str) -> bool:
+    ids, title_parts = rules
+    if surface in ids:
+        return True
+    lowered = title.lower()
+    return any(part in lowered for part in title_parts)
 
 MAX_ACTIONS_PER_STOP = 3
 ACTION_BACKOFF = (30, 60, 120)  # seconds between repeated actions on the same stop
@@ -98,7 +132,13 @@ def classify(tail: str) -> tuple:
         return "busy", ""
     for marker in GOAL_PAUSED_MARKERS:
         if marker in lowered:
-            return "goal-paused", marker
+            # A paused goal is only a candidate when a transient error is
+            # visible too — users pause goals deliberately all the time, and
+            # a deliberate pause has no error text on screen.
+            for cap in CAPACITY_MARKERS:
+                if cap in lowered:
+                    return "goal-paused", cap
+            return "goal-paused-no-error", marker
     for marker in CAPACITY_MARKERS:
         if marker in lowered:
             return "capacity-stopped", marker
@@ -143,6 +183,7 @@ class Config:
     log_file: str
     stats_file: str
     watchers: dict = field(default_factory=dict)  # surface -> Watcher
+    ignore_rules: tuple = (set(), [])
 
 
 def log(cfg: Config, message: str) -> None:
@@ -187,6 +228,16 @@ def verify_resumed(surface: str) -> tuple:
 
 
 def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") -> None:
+    if is_ignored(cfg.ignore_rules, watcher.surface, watcher.title):
+        return
+    if state == "goal-paused-no-error":
+        fp = fingerprint(state, tail)
+        if fp != watcher.last_fingerprint:
+            watcher.last_fingerprint = fp
+            log(cfg, f"{watcher.surface}: goal paused without an error on screen; deliberate pause, leaving it")
+            record(cfg, "deliberate_pause_skipped", surface=watcher.surface, title=watcher.title,
+                   fingerprint=fp, excerpt=tail_excerpt(tail))
+        return
     command = "continue" if state == "capacity-stopped" else "/goal resume"
     now = time.time()
     fp = fingerprint(state, tail)
@@ -282,6 +333,9 @@ def discover_codex_surfaces(cfg: Config) -> None:
                 continue
             lowered = tail.lower()
             if any(marker in lowered for marker in CODEX_SESSION_MARKERS):
+                if is_ignored(cfg.ignore_rules, sid, title.strip()):
+                    log(cfg, f"discovery: ignoring excluded session {sid} ({title.strip()})")
+                    continue
                 cfg.watchers[sid] = Watcher(surface=sid, title=title.strip())
                 log(cfg, f"discovery: now watching Codex session {sid} ({title.strip()})")
 
@@ -311,6 +365,8 @@ def report(stats_file: str) -> int:
     unconfirmed = [e for e in events if e.get("event") == "resume_unconfirmed"]
     send_errors = [e for e in events if e.get("event") == "send_error"]
     blocked = [e for e in events if e.get("event") == "composer_blocked"]
+    deliberate = [e for e in events if e.get("event") == "deliberate_pause_skipped"]
+    stalls = [e for e in events if e.get("event") == "stall_observed"]
     slow = [e for e in events if e.get("event") == "slow_lane"]
 
     print(f"events: {len(events)}  (since {events[0].get('ts', '?')})")
@@ -332,7 +388,7 @@ def report(stats_file: str) -> int:
             mid = len(latencies) // 2
             median = latencies[mid] if len(latencies) % 2 else (latencies[mid - 1] + latencies[mid]) / 2
             print(f"time-to-resume: median {median}s, max {latencies[-1]}s")
-    print(f"composer-blocked deferrals: {len(blocked)}  slow-lane entries: {len(slow)}")
+    print(f"composer-blocked deferrals: {len(blocked)}  slow-lane entries: {len(slow)}  deliberate pauses left alone: {len(deliberate)}  stalls observed (never acted on): {len(stalls)}")
 
     # Which error signatures are killing sessions, with one example each —
     # this is how we decide what to add to or tune in the marker list.
@@ -409,6 +465,7 @@ def main() -> int:
 
     last_discovery = 0.0
     while True:
+        cfg.ignore_rules = load_ignore_rules()
         if args.all_codex and time.time() - last_discovery >= DISCOVERY_INTERVAL:
             discover_codex_surfaces(cfg)
             last_discovery = time.time()
@@ -425,14 +482,21 @@ def main() -> int:
                     continue
                 if state == "goal-stalled-candidate":
                     # Between-turn gaps are seconds; only a persistent idle
-                    # "pursuing goal" footer is a real stall.
+                    # "pursuing goal" footer is a real stall. Observe-only:
+                    # a stall has no error signature, and we never resume
+                    # anything without one — but knowing stalls happen informs
+                    # future policy.
                     watcher.stalled_polls += 1
-                    if watcher.stalled_polls < STALL_POLLS_REQUIRED:
-                        continue
-                    state = "goal-stalled"
-                else:
-                    watcher.stalled_polls = 0
-                if state in ("goal-paused", "capacity-stopped", "goal-stalled"):
+                    if watcher.stalled_polls >= STALL_POLLS_REQUIRED:
+                        fp = fingerprint("goal-stalled", tail)
+                        if fp != watcher.last_fingerprint:
+                            watcher.last_fingerprint = fp
+                            log(cfg, f"{watcher.surface}: goal footer active but no turn running (stall; observe-only)")
+                            record(cfg, "stall_observed", surface=watcher.surface, title=watcher.title,
+                                   fingerprint=fp, excerpt=tail_excerpt(tail))
+                    continue
+                watcher.stalled_polls = 0
+                if state in ("goal-paused", "goal-paused-no-error", "capacity-stopped"):
                     act(cfg, watcher, state, tail, marker)
             except Exception as exc:
                 if surface in args.surface:
