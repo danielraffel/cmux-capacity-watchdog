@@ -33,7 +33,7 @@ CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-09-19.10"
+WATCHDOG_VERSION = "2026-09-19.11"
 
 # A turn is running when any of these appear in the tail.
 BUSY_MARKERS = ("esc to interrupt",)
@@ -499,13 +499,21 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
             log(cfg, f"{watcher.surface}: ambiguous send plus user text in the composer; deferring to the human")
             watcher.next_action_at = now + 120
             return
-        # The leftover text was cleared and the session is still stopped:
-        # re-arm and fall through to a fresh send below.
-        log(cfg, f"{watcher.surface}: ambiguous send's leftover command was cleared; sending fresh")
-        record(cfg, "ambiguous_retry", surface=watcher.surface, title=watcher.title,
-               command=pending["command"], via="fresh-send")
-        watcher.pending = None
-        watcher.marker_seen = ""
+        # The composer is empty — which is exactly what a SUCCESSFUL
+        # submission looks like too, so this is not proof the user cleared
+        # anything. A fresh send here could duplicate the command. Treat the
+        # command as possibly submitted: park a late-confirmation pending and
+        # send nothing further for this stop. If no turn ever appears the stop
+        # stays parked and visible, which is the safe direction.
+        log(cfg, f"{watcher.surface}: composer empty after ambiguous send; treating as possibly submitted, not resending")
+        record(cfg, "ambiguous_assumed_submitted", surface=watcher.surface, title=watcher.title,
+               command=pending["command"], attempt=pending["attempt"])
+        notify("watchdog: ambiguous submit", f"{watcher.surface}: command may or may not have submitted; check the session")
+        watcher.pending = {"command": pending["command"], "attempt": pending["attempt"],
+                           "lane": pending["lane"], "sent_at": now,
+                           "stop_since": pending["stop_since"]}
+        watcher.next_action_at = now + SLOW_LANE_INTERVAL
+        return
 
     if state in ("goal-paused", "capacity-stopped"):
         # Marker novelty: this exact marker instance was already evaluated and
