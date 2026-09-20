@@ -49,6 +49,33 @@ COMPOSER_PLACEHOLDERS = ("ask codex to do anything", "ask kimi", "type a message
 CODEX_SESSION_MARKERS = ("ask codex to do anything", "gpt-")
 DISCOVERY_INTERVAL = 300.0  # seconds between scans for new Codex sessions
 
+# A stop is only resume-eligible when the watchdog personally saw the surface
+# busy recently — a transition it witnessed. A session discovered already
+# stopped (typical for deliberately abandoned tabs whose tails still show an
+# old capacity error) is skipped. Witnessed-busy times persist across restarts.
+WITNESS_FRESHNESS = 2 * 3600  # seconds since last seen busy
+WITNESS_FILE = os.path.expanduser("~/.local/state/cmux-capacity-watchdog-witness.json")
+
+
+def load_witnesses() -> dict:
+    try:
+        with open(WITNESS_FILE) as handle:
+            return {k: float(v) for k, v in json.load(handle).items()}
+    except Exception:
+        return {}
+
+
+def save_witnesses(watchers: dict) -> None:
+    data = {surface: w.last_seen_busy for surface, w in watchers.items() if w.last_seen_busy > 0}
+    try:
+        os.makedirs(os.path.dirname(WITNESS_FILE), exist_ok=True)
+        with open(WITNESS_FILE + ".tmp", "w") as handle:
+            json.dump(data, handle)
+        os.replace(WITNESS_FILE + ".tmp", WITNESS_FILE)
+    except OSError:
+        pass
+
+
 # Sessions that must never be touched: one rule per line in the ignore file.
 # A bare line matches a surface UUID; "title:<text>" matches a title substring
 # (case-insensitive). Read on every cycle, so edits take effect immediately —
@@ -173,6 +200,7 @@ class Watcher:
     parked: bool = False
     stop_since: float = 0.0
     stalled_polls: int = 0
+    last_seen_busy: float = 0.0
 
 
 @dataclass
@@ -228,6 +256,19 @@ def verify_resumed(surface: str) -> tuple:
 
 def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") -> None:
     if is_ignored(cfg.ignore_rules, watcher.surface, watcher.title):
+        return
+    if watcher.last_seen_busy == 0 or time.time() - watcher.last_seen_busy > WITNESS_FRESHNESS:
+        # Never witnessed busy (or not recently): almost certainly a
+        # deliberately stopped or abandoned session, so leave it alone.
+        fp = fingerprint(state, tail)
+        if fp != watcher.last_fingerprint:
+            watcher.last_fingerprint = fp
+            age = "never" if watcher.last_seen_busy == 0 else f"{int((time.time() - watcher.last_seen_busy) / 3600)}h ago"
+            log(cfg, f"{watcher.surface}: {state} but last seen busy {age}; leaving it (witness rule)")
+            record(cfg, "stale_stop_skipped", surface=watcher.surface, title=watcher.title,
+                   state=state, marker=marker, last_seen_busy_age_s=(
+                       None if watcher.last_seen_busy == 0 else round(time.time() - watcher.last_seen_busy, 1)),
+                   fingerprint=fp, excerpt=tail_excerpt(tail))
         return
     if state == "goal-paused-no-error":
         fp = fingerprint(state, tail)
@@ -298,7 +339,7 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
         record(cfg, "send_error", surface=watcher.surface, command=command, error=str(exc))
 
 
-def discover_codex_surfaces(cfg: Config) -> None:
+def discover_codex_surfaces(cfg: Config, witnesses: dict) -> None:
     """Find every Codex session known to cmux and add it to the watch set.
 
     Enumeration is workspace -> pane surfaces -> a short screen read; the
@@ -336,7 +377,8 @@ def discover_codex_surfaces(cfg: Config) -> None:
                 if is_ignored(cfg.ignore_rules, sid, title.strip()):
                     log(cfg, f"discovery: ignoring excluded session {sid} ({title.strip()})")
                     continue
-                cfg.watchers[sid] = Watcher(surface=sid, title=title.strip())
+                cfg.watchers[sid] = Watcher(surface=sid, title=title.strip(),
+                                            last_seen_busy=witnesses.get(sid, 0.0))
                 log(cfg, f"discovery: now watching Codex session {sid} ({title.strip()})")
 
 
@@ -367,6 +409,7 @@ def report(stats_file: str) -> int:
     blocked = [e for e in events if e.get("event") == "composer_blocked"]
     deliberate = [e for e in events if e.get("event") == "deliberate_pause_skipped"]
     stalls = [e for e in events if e.get("event") == "stall_observed"]
+    stale = [e for e in events if e.get("event") == "stale_stop_skipped"]
     slow = [e for e in events if e.get("event") == "slow_lane"]
 
     print(f"events: {len(events)}  (since {events[0].get('ts', '?')})")
@@ -388,7 +431,7 @@ def report(stats_file: str) -> int:
             mid = len(latencies) // 2
             median = latencies[mid] if len(latencies) % 2 else (latencies[mid - 1] + latencies[mid]) / 2
             print(f"time-to-resume: median {median}s, max {latencies[-1]}s")
-    print(f"composer-blocked deferrals: {len(blocked)}  slow-lane entries: {len(slow)}  deliberate pauses left alone: {len(deliberate)}  stalls observed (never acted on): {len(stalls)}")
+    print(f"composer-blocked deferrals: {len(blocked)}  slow-lane entries: {len(slow)}  deliberate pauses left alone: {len(deliberate)}  stalls observed (never acted on): {len(stalls)}  stale stops skipped (witness rule): {len(stale)}")
 
     # Which error signatures are killing sessions, with one example each —
     # this is how we decide what to add to or tune in the marker list.
@@ -459,15 +502,17 @@ def main() -> int:
         parser.error("give at least one --surface or pass --all-codex")
 
     cfg = Config(interval=args.interval, dry_run=args.dry_run, log_file=args.log, stats_file=args.stats)
+    witnesses = load_witnesses()
     for surface in args.surface:
-        cfg.watchers[surface] = Watcher(surface=surface)
+        cfg.watchers[surface] = Watcher(surface=surface, last_seen_busy=witnesses.get(surface, 0.0))
     log(cfg, f"watching {len(cfg.watchers)} surface(s), interval {cfg.interval}s, dry_run={cfg.dry_run}, all_codex={args.all_codex}")
 
     last_discovery = 0.0
+    witnesses_dirty = False
     while True:
         cfg.ignore_rules = load_ignore_rules()
         if args.all_codex and time.time() - last_discovery >= DISCOVERY_INTERVAL:
-            discover_codex_surfaces(cfg)
+            discover_codex_surfaces(cfg, witnesses)
             last_discovery = time.time()
         for surface, watcher in list(cfg.watchers.items()):
             try:
@@ -475,10 +520,14 @@ def main() -> int:
                 state, marker = classify(tail)
                 if state == "busy":
                     # A running turn proves the last resume worked; re-arm.
+                    if watcher.last_seen_busy == 0:
+                        record(cfg, "witnessed_busy", surface=watcher.surface, title=watcher.title)
+                    watcher.last_seen_busy = time.time()
                     watcher.last_fingerprint = ""
                     watcher.actions_on_stop = 0
                     watcher.parked = False
                     watcher.stalled_polls = 0
+                    witnesses_dirty = True
                     continue
                 if state == "goal-stalled-candidate":
                     # Between-turn gaps are seconds; only a persistent idle
@@ -505,6 +554,9 @@ def main() -> int:
                     # Discovered surface went away (tab closed); drop it.
                     log(cfg, f"discovery: stopped watching {surface} ({exc})")
                     del cfg.watchers[surface]
+        if witnesses_dirty:
+            save_witnesses(cfg.watchers)
+            witnesses_dirty = False
         time.sleep(cfg.interval)
 
 

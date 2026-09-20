@@ -22,6 +22,14 @@ Explicit exclusions live in `~/.config/cmux-capacity-watchdog/ignore` (one
 surface UUID or `title:<substring>` per line, reloaded every cycle — edits take
 effect immediately, no restart).
 
+Witness rule: a stop is only resume-eligible when the watchdog personally saw
+the session busy within the last 2 hours (persisted across restarts in
+`~/.local/state/cmux-capacity-watchdog-witness.json`). A session discovered
+already stopped — the classic deliberately-abandoned tab with an old capacity
+error still on screen — is logged as `stale_stop_skipped` and left alone.
+Consequence: a session that dies while the watchdog itself is down stays
+stopped until you resume it once by hand.
+
 Runs gently: three quick attempts per stop (30s/60s/120s apart), then a slow
 lane of one retry every 15 minutes until the storm passes, with a cmux
 notification when it enters the slow lane.
