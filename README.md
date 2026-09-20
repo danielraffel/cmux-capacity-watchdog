@@ -50,8 +50,10 @@ The point is answering "what do we tune next" from data, not vibes.
 ## Deploy
 
 Runs as a LaunchAgent (`com.danielraffel.cmux-capacity-watchdog`) on each
-machine, pointed at this checkout; `~/bin/cmux-capacity-watchdog.py` is a
-symlink here. Update flow: `git pull && launchctl kickstart -k gui/$(id -u)/com.danielraffel.cmux-capacity-watchdog`.
+machine. `~/bin/cmux-capacity-watchdog.py` is a plain copy of the script —
+not a symlink; launchd/TCC refuses to exec a symlink whose target lives on an
+external volume. Update flow: `git pull` on both machines, `cp` the script to
+`~/bin/`, then `launchctl kickstart -k gui/$(id -u)/com.danielraffel.cmux-capacity-watchdog`.
 
 ## Known issues
 
