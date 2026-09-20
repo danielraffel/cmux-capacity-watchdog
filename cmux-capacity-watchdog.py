@@ -33,7 +33,7 @@ CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-09-19.8"
+WATCHDOG_VERSION = "2026-09-19.9"
 
 # A turn is running when any of these appear in the tail.
 BUSY_MARKERS = ("esc to interrupt",)
@@ -381,7 +381,8 @@ def send_once(cfg: Config, watcher: Watcher, command: str, state: str, marker: s
         record(cfg, "submit_ambiguous", surface=watcher.surface, title=watcher.title, command=command)
         notify("watchdog: ambiguous submit", f"{watcher.surface}: Enter may have landed; not retrying automatically")
         watcher.pending = {"command": command, "attempt": watcher.actions_on_stop,
-                           "lane": lane, "sent_at": now, "stop_since": watcher.stop_since}
+                           "lane": lane, "sent_at": now, "stop_since": watcher.stop_since,
+                           "ambiguous": True}
         watcher.next_action_at = time.time() + SLOW_LANE_INTERVAL
         return "error"
     except Exception as exc:
@@ -427,6 +428,53 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
                        None if watcher.last_seen_busy == 0 else round(time.time() - watcher.last_seen_busy, 1)),
                    fingerprint=fp, excerpt=tail_excerpt(tail))
         return
+    now = time.time()
+    pending = watcher.pending
+    if pending and pending.get("ambiguous"):
+        # An earlier send may or may not have submitted. The composer resolves
+        # it: our command sitting there untouched means Enter never landed and
+        # pressing it now submits exactly our own command; a cleared composer
+        # means the user tidied up and a fresh send is safe; user text means a
+        # human is engaged, so defer.
+        if now < watcher.next_action_at:
+            return
+        content = composer_content(tail)
+        if content == pending["command"]:
+            log(cfg, f"{watcher.surface}: ambiguous send left our command untouched in the composer; pressing Enter")
+            record(cfg, "ambiguous_retry", surface=watcher.surface, title=watcher.title,
+                   command=pending["command"], via="enter")
+            try:
+                cmux("send-key", "--surface", watcher.surface, "enter")
+            except Exception as exc:
+                log(cfg, f"{watcher.surface}: ambiguous retry failed: {exc}")
+                record(cfg, "send_error", surface=watcher.surface, command=pending["command"], error=str(exc))
+                watcher.next_action_at = now + SLOW_LANE_INTERVAL
+                return
+            watcher.pending = None
+            confirmed, post_state, _post_tail = verify_resumed(watcher.surface)
+            if confirmed:
+                elapsed = round(now - pending["stop_since"], 1) if pending["stop_since"] else None
+                log(cfg, f"{watcher.surface}: resumed via Enter retry, turn is running")
+                record(cfg, "resumed", surface=watcher.surface, title=watcher.title,
+                       command=pending["command"], attempt=pending["attempt"], lane=pending["lane"],
+                       since_stop_s=elapsed)
+                return
+            # Still stopped: re-arm the marker so normal retries can proceed.
+            watcher.marker_seen = ""
+            watcher.next_action_at = time.time() + SLOW_LANE_INTERVAL
+            return
+        if composer_has_text(tail):
+            log(cfg, f"{watcher.surface}: ambiguous send plus user text in the composer; deferring to the human")
+            watcher.next_action_at = now + 120
+            return
+        # The leftover text was cleared and the session is still stopped:
+        # re-arm and fall through to a fresh send below.
+        log(cfg, f"{watcher.surface}: ambiguous send's leftover command was cleared; sending fresh")
+        record(cfg, "ambiguous_retry", surface=watcher.surface, title=watcher.title,
+               command=pending["command"], via="fresh-send")
+        watcher.pending = None
+        watcher.marker_seen = ""
+
     if state in ("goal-paused", "capacity-stopped"):
         # Marker novelty: this exact marker instance was already evaluated and
         # not cleared by a busy turn or one of our sends, so it is stale
@@ -594,6 +642,7 @@ def report(stats_file: str) -> int:
     unconfirmed = [e for e in events if e.get("event") == "resume_unconfirmed"]
     send_errors = [e for e in events if e.get("event") == "send_error"]
     ambiguous = [e for e in events if e.get("event") == "submit_ambiguous"]
+    ambiguous_retries = [e for e in events if e.get("event") == "ambiguous_retry"]
     blocked = [e for e in events if e.get("event") == "composer_blocked"]
     deliberate = [e for e in events if e.get("event") == "deliberate_pause_skipped"]
     stalls = [e for e in events if e.get("event") == "stall_observed"]
@@ -626,7 +675,7 @@ def report(stats_file: str) -> int:
           f"(goal resume: {sum(1 for e in actions if e.get('command') == '/goal resume')}, "
           f"continue: {sum(1 for e in actions if e.get('command') == 'continue')})")
     late = sum(1 for e in resumed if e.get("late"))
-    print(f"resumed OK: {len(resumed)} ({late} confirmed late)  unconfirmed: {len(unconfirmed)}  send errors: {len(send_errors)}  ambiguous submits (not retried): {len(ambiguous)}")
+    print(f"resumed OK: {len(resumed)} ({late} confirmed late)  unconfirmed: {len(unconfirmed)}  send errors: {len(send_errors)}  ambiguous submits: {len(ambiguous)} (resolved by retry: {len(ambiguous_retries)})")
     if resumed:
         attempts = sorted(e.get("attempt", 0) for e in resumed)
         latencies = sorted(e.get("since_stop_s") for e in resumed if e.get("since_stop_s") is not None)
