@@ -36,7 +36,7 @@ CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-09-20.1"
+WATCHDOG_VERSION = "2026-09-20.2"
 
 # A turn is running when any of these appear in the tail.
 BUSY_MARKERS = ("esc to interrupt",)
@@ -159,11 +159,18 @@ def read_tail(surface: str, lines: int = 30) -> str:
 
 
 def composer_content(tail: str) -> str:
-    """The text currently in the composer (best-effort, last composer line)."""
+    """The text currently in the composer (best-effort, last composer line).
+
+    Spinner overlays (braille glyphs, U+2800–U+28FF) can bleed into the
+    composer line in a screen read; they are display artifacts, not draft
+    text, so strip them before comparing.
+    """
     for line in reversed(tail.splitlines()):
         stripped = line.strip()
         if stripped.startswith("›"):
-            return stripped.lstrip("›").strip()
+            content = stripped.lstrip("›").strip()
+            content = "".join(c for c in content if not 0x2800 <= ord(c) <= 0x28FF)
+            return content.strip()
     return ""
 
 
