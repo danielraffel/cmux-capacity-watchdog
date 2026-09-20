@@ -63,6 +63,13 @@ aggregates: stops by type and marker, resume success/attempts/latency, flap
 rate (new stop within 5m of a resume), lane split, and per-surface offenders.
 The point is answering "what do we tune next" from data, not vibes.
 
+Every event carries a behavior version (`v`, the `WATCHDOG_VERSION` constant —
+bumped on every behavior change and mapped to commits via git history), and
+`--report` segments all metrics by version, so data from before a policy
+change is never misread under the new one. The startup line in the human log
+is self-describing (version, poll interval, ladder shape, slow lane, witness
+freshness).
+
 ## Deploy
 
 Runs as a LaunchAgent (`com.danielraffel.cmux-capacity-watchdog`) on each

@@ -30,6 +30,11 @@ from datetime import datetime
 
 CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 
+# Bump on EVERY behavior change. Every stats event carries this version, so
+# logs and reports stay interpretable across policy changes; the git history
+# maps versions to commits.
+WATCHDOG_VERSION = "2026-09-19.4"
+
 # A turn is running when any of these appear in the tail.
 BUSY_MARKERS = ("esc to interrupt",)
 # The goal is paused. Codex words it "Goal stalled (/goal resume)"; Kimi and
@@ -251,7 +256,7 @@ def record(cfg: Config, event: str, **fields) -> None:
     if not cfg.stats_file:
         return
     payload = {"ts": datetime.now().isoformat(timespec="seconds"),
-               "host": socket.gethostname(), "event": event, **fields}
+               "host": socket.gethostname(), "v": WATCHDOG_VERSION, "event": event, **fields}
     try:
         with open(cfg.stats_file, "a") as handle:
             handle.write(json.dumps(payload) + "\n")
@@ -497,6 +502,19 @@ def report(stats_file: str) -> int:
     slow = [e for e in events if e.get("event") == "slow_lane"]
 
     print(f"events: {len(events)}  (since {events[0].get('ts', '?')})")
+
+    # Version segmentation: behavior changes across versions, so aggregate
+    # per version instead of mixing policies into one number.
+    versions = {}
+    for e in events:
+        versions.setdefault(e.get("v", "pre-versioning"), []).append(e)
+    for version, vevents in versions.items():
+        v_stops = sum(1 for e in vevents if e.get("event") == "stop_detected")
+        v_actions = sum(1 for e in vevents if e.get("event") == "action")
+        v_resumed = sum(1 for e in vevents if e.get("event") == "resumed")
+        v_unconf = sum(1 for e in vevents if e.get("event") == "resume_unconfirmed")
+        print(f"  v{version}: {vevents[0].get('ts', '?')} → {vevents[-1].get('ts', '?')} — "
+              f"{v_stops} stops, {v_actions} actions, {v_resumed} resumed, {v_unconf} unconfirmed")
     print(f"stops detected: {len(stops)}")
     by_state = {}
     for e in stops:
@@ -590,7 +608,12 @@ def main() -> int:
     witnesses = load_witnesses(lambda message: log(cfg, message))
     for surface in args.surface:
         cfg.watchers[surface] = Watcher(surface=surface, last_seen_busy=witnesses.get(surface, 0.0))
-    log(cfg, f"watching {len(cfg.watchers)} surface(s), interval {cfg.interval}s, dry_run={cfg.dry_run}, all_codex={args.all_codex}")
+    log(cfg, f"watchdog v{WATCHDOG_VERSION} starting: poll {cfg.interval}s, fast ladder x{MAX_ACTIONS_PER_STOP} "
+             f"(backoff 5s->{FAST_BACKOFF_CAP}s, grace {CONFIRM_GRACE}s), slow lane {SLOW_LANE_INTERVAL}s, "
+             f"witness freshness {WITNESS_FRESHNESS // 3600}h, dry_run={cfg.dry_run}, all_codex={args.all_codex}")
+    record(cfg, "watchdog_started", interval_s=cfg.interval, fast_attempts=MAX_ACTIONS_PER_STOP,
+           slow_lane_s=SLOW_LANE_INTERVAL, witness_freshness_h=WITNESS_FRESHNESS // 3600,
+           dry_run=cfg.dry_run, all_codex=args.all_codex, pinned=list(cfg.watchers))
 
     last_discovery = 0.0
     witnesses_dirty = False
