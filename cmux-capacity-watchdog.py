@@ -33,7 +33,7 @@ CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-09-19.7"
+WATCHDOG_VERSION = "2026-09-19.8"
 
 # A turn is running when any of these appear in the tail.
 BUSY_MARKERS = ("esc to interrupt",)
@@ -164,7 +164,11 @@ def composer_content(tail: str) -> str:
 
 
 class ComposerContaminated(Exception):
-    pass
+    """The composer changed around our send; aborted before Enter."""
+
+
+class SubmitAmbiguous(Exception):
+    """Enter may have landed before the failure — never auto-retry this stop."""
 
 
 def send_literal(surface: str, text: str) -> None:
@@ -184,7 +188,13 @@ def send_literal(surface: str, text: str) -> None:
         # and Enter. cmux has no atomic validate-and-submit; the repair path
         # below covers the larger pre-read window, and a lost 100ms race at
         # worst submits a mangled command the client rejects. Accepted.
-        cmux("send-key", "--surface", surface, "enter")
+        try:
+            cmux("send-key", "--surface", surface, "enter")
+        except Exception as exc:
+            # A failure here is ambiguous: Enter may have landed before the
+            # error. Never auto-retry this stop, or a later poll could
+            # submit a duplicate command.
+            raise SubmitAmbiguous(f"enter submission uncertain: {exc}") from exc
         return
     if content.endswith(text) and len(content) > len(text):
         # Our text landed after the user's fresh keystrokes; remove exactly
@@ -362,10 +372,24 @@ def send_once(cfg: Config, watcher: Watcher, command: str, state: str, marker: s
         # marker or the novelty gate would dead-letter this stop forever.
         watcher.marker_seen = ""
         return "error"
+    except SubmitAmbiguous as exc:
+        # The Enter keystroke may have landed. Do NOT re-arm the marker (a
+        # duplicate command is worse than a paused stop); instead park a
+        # pending confirmation so a started turn is still credited, and let
+        # the composer guard defer any further sends until the draft clears.
+        log(cfg, f"{watcher.surface}: {exc}")
+        record(cfg, "submit_ambiguous", surface=watcher.surface, title=watcher.title, command=command)
+        notify("watchdog: ambiguous submit", f"{watcher.surface}: Enter may have landed; not retrying automatically")
+        watcher.pending = {"command": command, "attempt": watcher.actions_on_stop,
+                           "lane": lane, "sent_at": now, "stop_since": watcher.stop_since}
+        watcher.next_action_at = time.time() + SLOW_LANE_INTERVAL
+        return "error"
     except Exception as exc:
+        # Failures before Enter can only leave unsubmitted text behind, so
+        # the stop still stands and the marker re-arms for the next poll.
         log(cfg, f"{watcher.surface}: send failed: {exc}")
         record(cfg, "send_error", surface=watcher.surface, command=command, error=str(exc))
-        watcher.marker_seen = ""  # see above: no submission, stop still standing
+        watcher.marker_seen = ""
         return "error"
     confirmed, post_state, post_tail = verify_resumed(watcher.surface)
     if confirmed:
@@ -569,6 +593,7 @@ def report(stats_file: str) -> int:
     resumed = [e for e in events if e.get("event") == "resumed"]
     unconfirmed = [e for e in events if e.get("event") == "resume_unconfirmed"]
     send_errors = [e for e in events if e.get("event") == "send_error"]
+    ambiguous = [e for e in events if e.get("event") == "submit_ambiguous"]
     blocked = [e for e in events if e.get("event") == "composer_blocked"]
     deliberate = [e for e in events if e.get("event") == "deliberate_pause_skipped"]
     stalls = [e for e in events if e.get("event") == "stall_observed"]
@@ -601,7 +626,7 @@ def report(stats_file: str) -> int:
           f"(goal resume: {sum(1 for e in actions if e.get('command') == '/goal resume')}, "
           f"continue: {sum(1 for e in actions if e.get('command') == 'continue')})")
     late = sum(1 for e in resumed if e.get("late"))
-    print(f"resumed OK: {len(resumed)} ({late} confirmed late)  unconfirmed: {len(unconfirmed)}  send errors: {len(send_errors)}")
+    print(f"resumed OK: {len(resumed)} ({late} confirmed late)  unconfirmed: {len(unconfirmed)}  send errors: {len(send_errors)}  ambiguous submits (not retried): {len(ambiguous)}")
     if resumed:
         attempts = sorted(e.get("attempt", 0) for e in resumed)
         latencies = sorted(e.get("since_stop_s") for e in resumed if e.get("since_stop_s") is not None)
