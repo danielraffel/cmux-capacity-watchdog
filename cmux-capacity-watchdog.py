@@ -33,7 +33,7 @@ CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-09-19.12"
+WATCHDOG_VERSION = "2026-09-19.13"
 
 # A turn is running when any of these appear in the tail.
 BUSY_MARKERS = ("esc to interrupt",)
@@ -841,6 +841,13 @@ def main() -> int:
                     watcher.stalled_polls = 0
                     witnesses_dirty = True
                     continue
+                if state in ("idle", "goal-stalled-candidate") and watcher.pending:
+                    # The stop settled without a confirmable turn (a short
+                    # turn can complete between 5-minute polls, or the session
+                    # was cleaned up): nothing may suppress a future stop.
+                    watcher.pending = None
+                    log(cfg, f"{watcher.surface}: session settled ({state}) with a pending submission; clearing it")
+                    record(cfg, "pending_cleared_idle", surface=watcher.surface, title=watcher.title, state=state)
                 if state == "goal-stalled-candidate":
                     # Between-turn gaps are seconds; only a persistent idle
                     # "pursuing goal" footer is a real stall. Observe-only:
