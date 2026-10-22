@@ -174,9 +174,6 @@ DEFAULT_PROFILES = {
             {"question": r"^Do you want to (create|overwrite|make this edit to|make these edits to) \S+\?$",
              "files": "claude-memory", "answer": "1",
              "note": "Claude saving one of its own memory notes."},
-            {"question": r"^Do you want to proceed\?$",
-             "files": "claude-memory", "answer": "1",
-             "note": "Claude editing its own memory notes with a shell command."},
         ],
         "memory_roots": ["~/.claude", "~/.subrouter/codex/claude-proxy/*"],
     },
@@ -644,6 +641,13 @@ class Config:
 LOG_ROTATE_BYTES = 20 * 1024 * 1024
 
 
+def open_private_append(path: str):
+    """Open a log for appending, creating it readable only by the user:
+    screen excerpts and prompt questions can carry private text."""
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    return os.fdopen(fd, "a")
+
+
 def rotate_if_large(path: str) -> None:
     try:
         if os.path.getsize(path) >= LOG_ROTATE_BYTES:
@@ -657,7 +661,7 @@ def log(cfg: Config, message: str) -> None:
     print(line, flush=True)
     if cfg.log_file:
         rotate_if_large(cfg.log_file)
-        with open(cfg.log_file, "a") as handle:
+        with open_private_append(cfg.log_file) as handle:
             handle.write(line + "\n")
 
 
@@ -674,7 +678,7 @@ def record(cfg: Config, event: str, **fields) -> None:
                "host": socket.gethostname(), "v": WATCHDOG_VERSION, "event": event, **fields}
     try:
         rotate_if_large(cfg.stats_file)
-        with open(cfg.stats_file, "a") as handle:
+        with open_private_append(cfg.stats_file) as handle:
             handle.write(json.dumps(payload) + "\n")
     except Exception:
         pass
@@ -1438,12 +1442,14 @@ def _expand_roots(roots) -> list:
 
 def is_claude_memory_note(path: str, roots: list) -> bool:
     """`path` is absolute and names <root>/projects/<project>/memory/<n>.md
-    for one of the memory roots, after resolving symlinks in its folder. A
-    file that merely shares a memory note's name elsewhere never matches."""
+    for one of the memory roots, with symlinks resolved, the file's own
+    included. A file that merely shares a memory note's name elsewhere
+    never matches."""
     if not path.startswith("/") or not path.endswith(".md"):
         return False
-    folder = os.path.realpath(os.path.dirname(os.path.normpath(path)))
-    if not os.path.basename(path):
+    resolved = os.path.realpath(os.path.normpath(path))
+    folder, name = os.path.dirname(resolved), os.path.basename(resolved)
+    if not name.endswith(".md"):
         return False
     for root in roots:
         projects = os.path.join(root, "projects") + "/"
@@ -1454,22 +1460,51 @@ def is_claude_memory_note(path: str, roots: list) -> bool:
     return False
 
 
+FILE_PROMPT_TITLES = ("Create file", "Edit file", "Overwrite file")
+
+
+def drawn_file_path(header) -> str:
+    """The one path Claude draws under its "Create file" / "Edit file" /
+    "Overwrite file" title, above the preview. Everything else in the
+    header (the preview between ╌ rules, earlier transcript) is written by
+    the model and is never evidence. "" unless exactly one title is found
+    after the last ─ rule with a single path line under it."""
+    lines = [line.rstrip() for line in header]
+    rule = max((i for i, line in enumerate(lines) if line.strip() and set(line.strip()) == {"─"}), default=-1)
+    lines = lines[rule + 1:]
+    titles = [i for i, line in enumerate(lines) if line.strip() in FILE_PROMPT_TITLES]
+    if len(titles) != 1:
+        return ""
+    path_lines = []
+    for line in lines[titles[0] + 1:]:
+        stripped = line.strip()
+        if not stripped or set(stripped) <= set("╌"):
+            break
+        path_lines.append(stripped)
+    path = "".join(path_lines)          # a long path wraps without spaces
+    if not path or len(path.split()) != 1:
+        return ""
+    return path
+
+
 def prompt_memory_paths(file: str, header, options, cwd: str) -> list:
-    """Absolute candidates for the file a prompt asks to write: path tokens
-    in the header ending in that file (relative ones resolved against the
-    session's working directory), and the folders an "allow access to"
-    option names."""
-    candidates = []
-    for token in _unwrap(header).split():
-        token = _path_token(token)
-        if not token.endswith("/" + file):
-            continue
-        if token.startswith("/"):
-            candidates.append(token)
-        elif token.startswith("~/"):
-            candidates.append(os.path.expanduser(token))
-        elif cwd:
-            candidates.append(os.path.normpath(os.path.join(cwd, token)))
+    """Absolute paths the prompt says it will write: the path Claude draws
+    under its file-prompt title, resolved against the session's working
+    directory when relative, plus the folders an "allow access to" option
+    names. Empty when the drawn path is missing, names a different file, or
+    is relative with no known working directory."""
+    drawn = _path_token(drawn_file_path(header))
+    if not drawn or os.path.basename(drawn) != file:
+        return []
+    if drawn.startswith("/"):
+        path = drawn
+    elif drawn.startswith("~/"):
+        path = os.path.expanduser(drawn)
+    elif cwd:
+        path = os.path.normpath(os.path.join(cwd, drawn))
+    else:
+        return []
+    candidates = [path]
     allow = ALLOW_ACCESS_DIRS.search(_unwrap(options))
     if allow:
         for folder in allow.group(1).split(","):
@@ -1479,40 +1514,29 @@ def prompt_memory_paths(file: str, header, options, cwd: str) -> list:
     return candidates
 
 
-def header_requests_only_memory_edit(header, roots: list) -> bool:
-    """A shell command's prompt: Claude says it "requested permissions to
-    edit/write" files; every path it names must be a memory note."""
-    text = _unwrap(header)
-    at = text.rfind("requested permissions to ")
-    if at < 0:
-        return False
-    request = text[at:]
-    if not request.startswith(("requested permissions to edit", "requested permissions to write")):
-        return False
-    paths = [os.path.expanduser(_path_token(t)) for t in request.split() if "/" in t]
-    return bool(paths) and all(is_claude_memory_note(t, roots) for t in paths)
-
-
 def prompt_rule_for(profile: Profile, prompt, cwd: str):
     """(rule, reason): the first rule that answers the prompt, or None and
-    the reason none did, for the record."""
+    the reason none did, for the record. Every rule must say which files it
+    covers; only "claude-memory" exists."""
     question, file, header, options = prompt
     roots = _expand_roots(profile.rules.get("memory_roots", []))
     reason = "no rule matches the question"
     for rule in profile.rules.get("prompt_rules", []):
-        if not re.search(rule["question"], question):
+        pattern, answer = rule.get("question"), rule.get("answer")
+        if not isinstance(pattern, str) or not isinstance(answer, str) or not answer:
+            continue
+        try:
+            if not re.search(pattern, question):
+                continue
+        except re.error:
             continue
         if rule.get("files") != "claude-memory":
+            reason = "rule does not say which files it covers"
+            continue
+        paths = prompt_memory_paths(file, header, options, cwd) if file else []
+        if paths and all(is_claude_memory_note(path, roots) for path in paths):
             return rule, ""
-        if file:
-            paths = prompt_memory_paths(file, header, options, cwd)
-            if paths and all(is_claude_memory_note(path, roots) for path in paths):
-                return rule, ""
-            reason = "file is not a Claude memory note" if paths else "could not resolve the file's path"
-        elif header_requests_only_memory_edit(header, roots):
-            return rule, ""
-        else:
-            reason = "the command touches more than Claude memory notes"
+        reason = "file is not a Claude memory note" if paths else "could not resolve the file's path"
     return None, reason
 
 

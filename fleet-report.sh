@@ -29,11 +29,14 @@ status=0
 for host in "${HOSTS[@]}"; do
     if [ "$host" = local ]; then
         /usr/bin/python3 "$HOME/bin/cmux-capacity-watchdog.py" --problems "$HOURS" || status=1
-    elif ! ssh -o ConnectTimeout=10 -o BatchMode=yes "$host" \
-            "/usr/bin/python3 \$HOME/bin/cmux-capacity-watchdog.py --problems $HOURS"; then
+    else
+        ssh -o ConnectTimeout=10 -o BatchMode=yes -- "$host" \
+            "/usr/bin/python3 \$HOME/bin/cmux-capacity-watchdog.py --problems $HOURS"
         rc=$?
-        [ "$rc" -eq 1 ] || echo "$host: unreachable or watchdog missing (ssh exit $rc)"
-        status=1
+        # 1 means the host answered and needs attention; anything else means
+        # it couldn't be asked.
+        [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ] || echo "$host: unreachable or watchdog missing (ssh exit $rc)"
+        [ "$rc" -eq 0 ] || status=1
     fi
 done
 exit "$status"
