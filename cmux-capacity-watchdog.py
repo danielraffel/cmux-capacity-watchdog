@@ -71,7 +71,7 @@ INSTANCE_LOCK = None  # held for the process lifetime
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-10-22.4"
+WATCHDOG_VERSION = "2026-10-22.5"
 
 # Per-agent rules: how to recognise the agent's screen, when it is busy, what
 # its composer looks like, which on-screen errors are resume evidence, and
@@ -1834,7 +1834,10 @@ def handle_prompt(cfg: Config, watcher: Watcher, tail: str, prompt) -> None:
         if not current or hashlib.sha1(f"{current[0]}\n{_unwrap(current[2][-6:])}".encode()).hexdigest()[:12] != fp:
             watcher.prompt_fingerprint = ""
             return
-        cmux("send", "--surface", watcher.surface, rule["answer"])
+        # cmux refuses to type into an open question or permission dialog
+        # unless told to; answering that dialog is the point here, and the
+        # prompt was just re-read and matched.
+        cmux("send", "--force", "--surface", watcher.surface, rule["answer"])
         time.sleep(1.5)
         after = find_pending_prompt(read_tail(watcher.surface, profile.tail_lines))
     except Exception as exc:

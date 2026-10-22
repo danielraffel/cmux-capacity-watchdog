@@ -581,7 +581,7 @@ class PromptAnswerTest(unittest.TestCase):
 
     def test_answers_a_quiet_memory_prompt_when_enabled(self):
         sends, events = self.run_prompt(self.profile(answer_prompts=True), 6)
-        self.assertEqual(sends, [("send", "--surface", "P", "1")])
+        self.assertEqual(sends, [("send", "--force", "--surface", "P", "1")])
         self.assertEqual(events, ["prompt_answered"])
 
     def test_disabled_answering_types_nothing_and_reports_a_long_wait(self):
