@@ -760,6 +760,19 @@ class ProblemsReportTest(unittest.TestCase):
         self.assertIn("resume keeps failing", text)
         self.assertIn("[S2]", text)
 
+    def test_a_near_miss_answered_later_is_no_longer_listed(self):
+        path = self.write([
+            ("scan_completed", {}),
+            ("prompt_near_miss", {"surface": "S4", "question": "Do you want to create a.md?", "reason": "r"}),
+            ("prompt_answered", {"surface": "S4", "question": "Do you want to create a.md?"}),
+            ("prompt_near_miss", {"surface": "S5", "question": "Do you want to create b.md?", "reason": "r"}),
+            ("scan_completed", {}),
+        ])
+        status, text = self.run_problems(path)
+        self.assertNotIn("a.md", text.split("answered")[0] if False else "".join(l for l in text.splitlines(True) if "near miss" in l))
+        self.assertIn("b.md", text)
+        self.assertEqual(status, 1)
+
     def test_a_deliberate_pause_is_not_a_problem(self):
         path = self.write([
             ("scan_completed", {}),

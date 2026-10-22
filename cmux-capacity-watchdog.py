@@ -1305,7 +1305,11 @@ def problems(stats_file: str, since_hours: float) -> int:
         "stale_stop_skipped": lambda e: f"stopped on {e.get('marker')!r} before the watchdog saw it working; resume it once by hand",
         "primed_stopped": lambda e: f"stopped on {e.get('marker')!r} before the watchdog saw it working; resume it once by hand",
     }
-    near_misses = [e for e in events if e.get("event") == "prompt_near_miss"]
+    # A near miss stays listed until that tab has had the same prompt
+    # answered (a later version handled it); each open one is a case to fix.
+    answered_keys = {(e.get("surface"), e.get("question")) for e in events if e.get("event") == "prompt_answered"}
+    near_misses = [e for e in events if e.get("event") == "prompt_near_miss"
+                   and (e.get("surface"), e.get("question")) not in answered_keys]
     counts = {}
     open_issues = {}
     for e in events:
