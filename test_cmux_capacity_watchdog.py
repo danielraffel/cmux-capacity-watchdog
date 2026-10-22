@@ -431,6 +431,28 @@ class PromptAnswerTest(unittest.TestCase):
         self.assertFalse(watchdog.is_claude_memory_note(os.path.join(memory, "note.md"), [root]))
         self.assertTrue(watchdog.is_claude_memory_note(os.path.join(memory, "real.md"), [root]))
 
+    def test_a_long_note_whose_title_scrolled_off_is_matched_by_its_folder(self):
+        # Real memory notes are long: the preview fills the screen and the
+        # "Create file" title and path scroll away. Captured from Claude Code.
+        prompt = watchdog.find_pending_prompt(fixture("claude-memory-write-prompt-long.txt"))
+        self.assertEqual(prompt[0], "Do you want to create long-note.md?")
+        self.assertEqual(watchdog.drawn_file_path(prompt[2]), "")
+        rule, _ = watchdog.prompt_rule_for(self.profile(), prompt, "")
+        self.assertIsNotNone(rule)
+        rule, reason = watchdog.prompt_rule_for(watchdog.build_profiles({})["claude"], prompt, "")
+        self.assertIsNone(rule)
+        self.assertEqual(reason, "file is not a Claude memory note")
+
+    def test_listed_folders_must_all_be_memory_folders(self):
+        home = os.path.expanduser("~")
+        options = [" ❯ 1. Yes",
+                   f"   2. Yes, and always allow access to /tmp/repo, {home}/.claude/projects/p/memory for this session",
+                   " Esc to cancel · Tab to amend"]
+        paths = watchdog.prompt_memory_paths("x.md", [], options, "")
+        self.assertEqual(paths, ["/tmp/repo/x.md", f"{home}/.claude/projects/p/memory/x.md"])
+        roots = watchdog._expand_roots(["~/.claude"])
+        self.assertFalse(all(watchdog.is_claude_memory_note(p, roots) for p in paths))
+
     def test_a_rule_without_a_file_scope_never_answers(self):
         profile = watchdog.build_profiles({"claude": {"prompt_rules": [{"question": ".*", "answer": "1"}]}})["claude"]
         prompt = watchdog.find_pending_prompt(fixture("claude-memory-write-prompt.txt"))

@@ -71,7 +71,7 @@ INSTANCE_LOCK = None  # held for the process lifetime
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-10-22.1"
+WATCHDOG_VERSION = "2026-10-22.2"
 
 # Per-agent rules: how to recognise the agent's screen, when it is busy, what
 # its composer looks like, which on-screen errors are resume evidence, and
@@ -1451,7 +1451,9 @@ def report(stats_file: str) -> int:
 
 PROMPT_OPTION_LINE = re.compile(r"^[❯›>]?\s*1\.\s+\S")
 PROMPT_FILE_TOKEN = re.compile(r"(\S+\.[A-Za-z0-9]+)\?$")
-ALLOW_ACCESS_DIRS = re.compile(r"allow access to\s*(.+?)(?: for this session|\(shift\+tab\)|$)")
+# Greedy to the last " for this session", so a folder whose name contains
+# that phrase can't cut the listed path short.
+ALLOW_ACCESS_DIRS = re.compile(r"allow access to\s*(.+) for this session")
 # A permission prompt is answered only after it has sat unchanged this long:
 # a tab waiting on a person is quiet, and a prompt still drawing is not read.
 PROMPT_QUIET_SECONDS = 5.0
@@ -1586,8 +1588,20 @@ def prompt_memory_paths(file: str, header, options, cwd: str) -> list:
     directory when relative, plus the folders an "allow access to" option
     names. Empty when the drawn path is missing, names a different file, or
     is relative with no known working directory."""
+    folders = []
+    allow = ALLOW_ACCESS_DIRS.search(_unwrap(options))
+    if allow:
+        folders = [folder.strip() for folder in allow.group(1).split(",")]
+        if not folders or not all(folder.startswith("/") for folder in folders):
+            return []
+    allowed = [os.path.join(folder, file) for folder in folders]
     drawn = _path_token(drawn_file_path(header))
-    if not drawn or os.path.basename(drawn) != file:
+    if not drawn:
+        # A long preview scrolls the title and path off the screen. The
+        # options Claude draws still name the target's folder (as typed
+        # and resolved), and that is the only evidence left.
+        return allowed
+    if os.path.basename(drawn) != file:
         return []
     if drawn.startswith("/"):
         path = drawn
@@ -1597,14 +1611,7 @@ def prompt_memory_paths(file: str, header, options, cwd: str) -> list:
         path = os.path.normpath(os.path.join(cwd, drawn))
     else:
         return []
-    candidates = [path]
-    allow = ALLOW_ACCESS_DIRS.search(_unwrap(options))
-    if allow:
-        for folder in allow.group(1).split(","):
-            folder = folder.strip().rstrip(".")
-            if folder.startswith("/"):
-                candidates.append(os.path.join(folder, file))
-    return candidates
+    return [path] + allowed
 
 
 def prompt_rule_for(profile: Profile, prompt, cwd: str):

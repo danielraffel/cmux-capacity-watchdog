@@ -17,6 +17,7 @@ replies with text once the tool result comes back. No model is ever called.
 """
 
 import json
+import os
 import sys
 import threading
 import time
@@ -115,7 +116,8 @@ def _tool_use_events(model: str, path: str) -> list:
     message = {"id": "msg_stub_tool", "type": "message", "role": "assistant", "model": model,
                "content": [], "stop_reason": None, "stop_sequence": None,
                "usage": {"input_tokens": 10, "output_tokens": 1}}
-    tool_input = json.dumps({"file_path": path, "content": "---\nname: e2e-note\ndescription: stub\nmetadata:\n  type: project\n---\n\nstub note\n"})
+    body = "".join(f"line {i} of a long memory note\n" for i in range(int(os.environ.get("STUB_NOTE_LINES", "1"))))
+    tool_input = json.dumps({"file_path": path, "content": "---\nname: e2e-note\ndescription: stub\nmetadata:\n  type: project\n---\n\n" + body})
     return [
         ("message_start", {"type": "message_start", "message": message}),
         ("content_block_start", {"type": "content_block_start", "index": 0,
