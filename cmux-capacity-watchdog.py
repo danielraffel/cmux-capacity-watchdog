@@ -125,8 +125,9 @@ DEFAULT_PROFILES = {
         "enabled": True,
         # Claude Code draws its composer as a "❯" line between two rules. Its
         # selection dialogs also use "❯" but never inside the rules. A
-        # permission prompt hides the composer; its footer names Claude.
-        "detect_contains": ["tab to amend"],
+        # permission prompt hides the composer; its last line names Claude
+        # (see detect_agent).
+        "detect_contains": [],
         "detect_composer": True,
         "prompt_glyph": "❯",
         "composer_needs_border": True,
@@ -568,6 +569,13 @@ def detect_agent(tail: str, profiles: dict) -> str:
     for name, profile in profiles.items():
         if profile.enabled and profile.rules.get("detect_composer") and bordered_composer_index(lines) >= 0:
             return name
+    # A Claude permission prompt's footer, as the screen's last line. Text
+    # quoted higher up (a README, a transcript) doesn't count.
+    last = next((line.strip().lower() for line in reversed(lines) if line.strip()), "")
+    if "esc to cancel" in last and "tab to amend" in last:
+        for name, profile in profiles.items():
+            if profile.enabled and profile.rules.get("detect_composer"):
+                return name
     lowered = tail.lower()
     # Structural agents first: their text markers are specific, while the
     # Codex ones ("gpt-") are plain text another agent's transcript can quote.
@@ -608,6 +616,7 @@ class Watcher:
     prompt_since: float = 0.0
     prompt_reported: bool = False  # an unanswered prompt is reported once
     prompt_attempts: int = 0
+    prompt_answers: dict = field(default_factory=dict)  # fingerprint -> answer times
     last_fingerprint: str = ""
     actions_on_stop: int = 0
     next_action_at: float = 0.0
@@ -1122,6 +1131,10 @@ def recorded_agents(cli: str) -> dict:
         surface, agent = session.get("surface_id"), session.get("agent")
         if not surface or agent not in PROFILES:
             continue
+        # Most records are of agents that have exited; a shell may now run
+        # in that tab. Only a live session names the tab's agent.
+        if not session.get("active_for_surface") or not session.get("stored_pid_exists"):
+            continue
         stamp = session.get("updated_at_unix") or 0
         if surface not in newest or stamp >= newest[surface][1]:
             newest[surface] = (agent, stamp)
@@ -1372,6 +1385,9 @@ ALLOW_ACCESS_DIRS = re.compile(r"allow access to\s*(.+?)(?: for this session|\(s
 PROMPT_QUIET_SECONDS = 5.0
 # An unanswered prompt older than this is reported as waiting on a person.
 PROMPT_WAITING_REPORT_SECONDS = 300.0
+# The same prompt coming back after each answer (a write that keeps failing)
+# is left for a person after this many answers in an hour.
+PROMPT_MAX_ANSWERS_PER_HOUR = 3
 
 
 def find_pending_prompt(tail: str):
@@ -1382,18 +1398,23 @@ def find_pending_prompt(tail: str):
     end = len(lines)
     while end > 0 and not lines[end - 1].strip():
         end -= 1
-    if "esc to cancel" not in "\n".join(lines[max(0, end - 8):end]).lower():
+    # A live permission prompt is the bottom of the screen and replaces
+    # Claude's framed composer. A prompt quoted in output (a cat of a saved
+    # screen, a transcript) sits above a composer or shell prompt instead.
+    if end == 0 or "esc to cancel" not in lines[end - 1].lower():
+        return None
+    if bordered_composer_index(lines) >= 0:
         return None
     option = -1
     for i in range(end - 1, max(-1, end - 20), -1):
-        if PROMPT_OPTION_LINE.match(lines[i].strip()):
+        if PROMPT_OPTION_LINE.match(lines[i].strip()) and not lines[i].lstrip().startswith("⎿"):
             option = i
             break
     if option < 0:
         return None
     for i in range(option - 1, max(-1, option - 5), -1):
         question = lines[i].strip()
-        if not question.endswith("?"):
+        if not question.endswith("?") or question.startswith("⎿"):
             continue
         start = i
         # A long file name wraps the question; a wrapped remainder does not
@@ -1554,7 +1575,11 @@ def session_cwd(surface: str) -> str:
         data = json.loads(cmux("sessions", "list", "--json", "--surface", surface,
                                cli=SURFACE_CLI.get(surface, "")))
         for session in data.get("sessions", []):
-            cwd = session.get("cwd") or session.get("launch_working_directory") or ""
+            if not session.get("active_for_surface") or not session.get("stored_pid_exists"):
+                continue
+            # Claude draws a relative path against the directory it started
+            # in, which can differ from where its shell later moved.
+            cwd = session.get("launch_working_directory") or session.get("cwd") or ""
             if cwd:
                 break
     except Exception:
@@ -1594,7 +1619,9 @@ def handle_prompt(cfg: Config, watcher: Watcher, tail: str, prompt) -> None:
                    workspace=watcher.workspace, question=question[:200], file=file, reason=blocked,
                    waiting_s=round(now - watcher.prompt_since, 1))
         return
-    if watcher.prompt_attempts >= 2:
+    recent = [t for t in watcher.prompt_answers.get(fp, []) if now - t < 3600]
+    watcher.prompt_answers[fp] = recent
+    if watcher.prompt_attempts >= 2 or len(recent) >= PROMPT_MAX_ANSWERS_PER_HOUR:
         if not watcher.prompt_reported:
             watcher.prompt_reported = True
             log(cfg, f"{watcher.surface}: answered {question!r} twice and it is still showing; leaving it")
@@ -1612,6 +1639,7 @@ def handle_prompt(cfg: Config, watcher: Watcher, tail: str, prompt) -> None:
     except Exception as exc:
         log(cfg, f"{watcher.surface}: prompt answer failed: {exc}")
         return
+    watcher.prompt_answers.setdefault(fp, []).append(now)
     if after and after[0] == question:
         return  # still showing: one more try on the next poll
     log(cfg, f"{watcher.surface}: answered {rule['answer']!r} to {question!r} ({rule.get('note', '')})")
