@@ -44,6 +44,7 @@ without restarting anything.
 | `enabled` | `true` | Watch this agent at all |
 | `resume` | `true` | Type `continue` / `/goal resume` after a temporary provider error |
 | `answer_prompts` | `false` | Answer the permission prompts its prompt rules cover (Claude memory notes) |
+| `always_allow` | `true` | When answering, prefer "Yes, and always allow access to <memory folder>" |
 
 Each setting is per agent: put it under `"claude"` or `"codex"`.
 
@@ -153,8 +154,20 @@ only by you, since they can quote what's on screen.
   the prompt is left for you.
 - Text the model writes (a file preview, a command's description) is never
   used as evidence.
-- Shell-command prompts are never answered: a command can't be shown to be
-  safe from its on-screen text.
+- Shell-command prompts ("Do you want to proceed?") are answered in only one
+  case: the command Claude shows is exactly the session's one matching
+  pending `Bash` call, and that call is a plain literal write to a memory
+  note. There are two allowed forms:
+  - `echo '<text>' >> <note>`;
+  - `cat >>? <note> <<'EOF'` with a quoted heredoc and nothing after its
+    closing delimiter.
+
+  Any other command is left for you.
+- When Claude offers "Yes, and always allow access to <folder>" and every
+  folder listed is a memory folder, it picks that option (setting
+  `always_allow`, on by default), so Claude stops asking for later notes. It
+  never picks an option that also switches the session to accept edits, or
+  one that allows "similar commands".
 - Every answer is recorded, and so is every prompt left waiting more than 5
   minutes, with the reason it wasn't answered.
 - A **near miss** is a prompt whose question a rule answers but whose file

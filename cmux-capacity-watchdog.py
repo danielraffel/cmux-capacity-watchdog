@@ -71,7 +71,7 @@ INSTANCE_LOCK = None  # held for the process lifetime
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-10-22.5"
+WATCHDOG_VERSION = "2026-10-22.6"
 
 # Per-agent rules: how to recognise the agent's screen, when it is busy, what
 # its composer looks like, which on-screen errors are resume evidence, and
@@ -177,8 +177,21 @@ DEFAULT_PROFILES = {
             {"question": r"^Do you want to (create|overwrite|make this edit to|make these edits to) \S+\?$",
              "files": "claude-memory", "answer": "1",
              "note": "Claude saving one of its own memory notes."},
+            # Claude asks this for a "sensitive" file (a memory note reached
+            # through Subrouter's symlink) and for shell commands alike, so
+            # the screen can't tell them apart. It is answered only when the
+            # session's single pending tool call is a file edit of a memory
+            # note; a pending shell command is never answered.
+            {"question": r"^Do you want to proceed\?$",
+             "files": "claude-memory", "answer": "1",
+             "note": "Claude editing one of its own memory notes (sensitive-file prompt)."},
         ],
         "memory_roots": ["~/.claude", "~/.subrouter/codex/claude-proxy/*"],
+        # When Claude offers "Yes, and always allow access to <folder>" and
+        # every folder is a memory folder, choose it so Claude stops asking
+        # for later notes. Never chosen when that option also changes the
+        # session's mode or allows "similar commands".
+        "always_allow": True,
     },
 }
 
@@ -673,6 +686,7 @@ class Watcher:
     prompt_answers: dict = field(default_factory=dict)  # fingerprint -> answer times
     was_busy: bool = False  # last poll saw a running turn
     near_misses: set = field(default_factory=set)  # prompt fingerprints already captured
+    prompt_recheck_at: float = 0.0  # wake early to confirm a new prompt is quiet
     last_fingerprint: str = ""
     actions_on_stop: int = 0
     next_action_at: float = 0.0
@@ -1315,6 +1329,9 @@ def problems(stats_file: str, since_hours: float) -> int:
     print(f"{host}: {counts.get('resumed', 0)} resumed, {counts.get('prompt_answered', 0)} prompts answered, "
           f"{len(near_misses)} near misses, "
           f"{counts.get('stop_detected', 0)} stops seen, {len(scans)} scans in the last {since_hours:g} h")
+    answered = [e for e in events if e.get("event") == "prompt_answered"]
+    for e in answered[-5:]:
+        print(f"  + {e.get('ts', '')[11:19]} answered {e.get('question')!r} — {where(e)}")
     for issue in issues:
         print(f"  ! {issue}")
     if not issues:
@@ -1582,6 +1599,30 @@ def is_claude_memory_note(path: str, roots: list) -> bool:
 
 
 FILE_PROMPT_TITLES = ("Create file", "Edit file", "Overwrite file")
+ALWAYS_ALLOW_OPTION = re.compile(
+    r"\A2\. Yes, and always allow access to (.+?) (?:from this project|for this session)(?: \(shift\+tab\))?\Z")
+
+
+def always_allow_answer(options, roots: list) -> str:
+    """ "2" when option 2 is exactly "Yes, and always allow access to
+    <folders>" and every folder is a Claude memory folder, else "". """
+    lines = [line.strip().lstrip("❯").strip() for line in options]
+    start = next((i for i, line in enumerate(lines) if line.startswith("2.")), -1)
+    if start < 0:
+        return ""
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("3.")), -1)
+    if end < 0:
+        return ""
+    text = _unwrap(lines[start:end])
+    match = ALWAYS_ALLOW_OPTION.match(text)
+    if not match:
+        return ""
+    # A long folder wraps mid-name, leaving a space; paths here have none.
+    folders = ["".join(folder.split()) for folder in match.group(1).split(",")]
+    if not folders or not all(folder.startswith("/") and
+                              is_claude_memory_note(os.path.join(folder, "x.md"), roots) for folder in folders):
+        return ""
+    return "2"
 
 
 def drawn_file_path(header) -> str:
@@ -1640,7 +1681,51 @@ def prompt_memory_paths(file: str, header, options, cwd: str) -> list:
     return [path] + allowed
 
 
-def prompt_rule_for(profile: Profile, prompt, cwd: str, pending=None):
+# The one shell command answered: appending a single-quoted literal line to
+# a memory note. No expansions, chaining or other redirection can hide in it.
+MEMORY_APPEND = re.compile(r"\Aecho '([^']*)' >> (/[^\s;&|<>`$'\"]+)\Z")
+# Or writing a literal block with a quoted heredoc (no expansion in the
+# body), and nothing after the closing delimiter.
+MEMORY_HEREDOC = re.compile(
+    r"\Acat >>? (/[^\s;&|<>`$'\"]+) <<'([A-Za-z_][A-Za-z0-9_]*)'\n(.*)\n\2\Z", re.S)
+
+
+def memory_write_target(command: str) -> str:
+    """The memory-note path a shell command writes, if it is one of the two
+    literal forms; "" for anything else."""
+    command = command.strip()
+    append = MEMORY_APPEND.match(command)
+    if append:
+        return append.group(2)
+    heredoc = MEMORY_HEREDOC.match(command)
+    if heredoc and ("\n" + heredoc.group(2) + "\n") not in ("\n" + heredoc.group(3) + "\n"):
+        return heredoc.group(1)
+    return ""
+
+
+def bash_box_command(header) -> str:
+    """The command Claude draws in its "Bash command" box, between the ╌
+    rules under that title, after the last ─ rule. "" when not visible."""
+    lines = [line.rstrip() for line in header]
+    rule = max((i for i, line in enumerate(lines) if line.strip() and set(line.strip()) == {"─"}), default=-1)
+    lines = lines[rule + 1:]
+    titles = [i for i, line in enumerate(lines) if line.strip().startswith("Bash command")]
+    if len(titles) != 1:
+        return ""
+    dashes = [i for i in range(titles[0] + 1, len(lines)) if lines[i].strip() and set(lines[i].strip()) <= set("╌")]
+    if len(dashes) < 2:
+        return ""
+    body = lines[dashes[0] + 1:dashes[1]]
+    if not body or not all(line.lstrip().startswith("│") for line in body):
+        return ""
+    return "\n".join(line.lstrip()[1:].strip() for line in body)
+
+
+def _squash(text: str) -> str:
+    return "".join(text.split())
+
+
+def prompt_rule_for(profile: Profile, prompt, cwd: str, pending=None, pending_any=None):
     """(rule, reason): the first rule that answers the prompt, or None and
     the reason none did, for the record. Every rule must say which files it
     covers; only "claude-memory" exists. `pending(file)` returns the target
@@ -1661,8 +1746,38 @@ def prompt_rule_for(profile: Profile, prompt, cwd: str, pending=None):
         if rule.get("files") != "claude-memory":
             reason = "rule does not say which files it covers"
             continue
-        paths = prompt_memory_paths(file, header, options, cwd) if file else []
-        if not paths and file and pending:
+        if not file:
+            calls = pending_any() if pending_any else []
+            shown = bash_box_command(header)
+            if shown:
+                # A shell command: the call is the pending Bash whose command
+                # is exactly the one Claude shows, and it must be a plain
+                # append of a literal line to a memory note.
+                matches = [command for name, _path, command in calls
+                           if name == "Bash" and _squash(command) == _squash(shown)]
+                if len(matches) != 1:
+                    reason = "the shown command is not exactly one pending call"
+                    continue
+                target = memory_write_target(matches[0])
+                if target and is_claude_memory_note(target, roots):
+                    return rule, ""
+                reason = "the command is not a plain append to a Claude memory note"
+                continue
+            # No file named in the question: only the session's one pending
+            # call can say what is being asked. Exactly one, a file edit.
+            if len(calls) != 1:
+                reason = "the pending action is ambiguous" if calls else "could not resolve the file's path"
+                continue
+            name, target, _command = calls[0]
+            if name not in FILE_TOOLS:
+                reason = f"the pending action is {name}, not a file edit"
+                continue
+            if target and is_claude_memory_note(target, roots):
+                return rule, ""
+            reason = "file is not a Claude memory note"
+            continue
+        paths = prompt_memory_paths(file, header, options, cwd)
+        if not paths and pending:
             paths = pending(file)
             if len(set(paths)) > 1:
                 # Two unanswered writes with this name: can't tell which one
@@ -1679,9 +1794,9 @@ FILE_TOOLS = ("Write", "Edit", "MultiEdit")
 TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024
 
 
-def _pending_file_calls(path: str, file: str) -> list:
-    """file_path of each file tool call in a transcript that has no result
-    yet and targets a file with this name."""
+def _pending_calls(path: str) -> list:
+    """(tool name, file_path or "", command or "") of each tool call in a
+    transcript's tail that has no result yet."""
     try:
         with open(path, "rb") as handle:
             handle.seek(0, os.SEEK_END)
@@ -1692,7 +1807,7 @@ def _pending_file_calls(path: str, file: str) -> list:
         return []
     calls, answered = {}, set()
     for line in data.splitlines():
-        if file not in line and "tool_result" not in line:
+        if "tool_use" not in line and "tool_result" not in line:
             continue
         try:
             row = json.loads(line)
@@ -1703,22 +1818,23 @@ def _pending_file_calls(path: str, file: str) -> list:
         for block in content if isinstance(content, list) else []:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") == "tool_use" and block.get("name") in FILE_TOOLS:
-                target = (block.get("input") or {}).get("file_path")
-                if isinstance(target, str) and os.path.basename(target) == file:
-                    calls[block.get("id")] = target
+            if block.get("type") == "tool_use":
+                tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+                target, command = tool_input.get("file_path"), tool_input.get("command")
+                calls[block.get("id")] = (str(block.get("name")),
+                                          target if isinstance(target, str) else "",
+                                          command if isinstance(command, str) else "")
             elif block.get("type") == "tool_result":
                 answered.add(block.get("tool_use_id"))
-    return [target for call, target in calls.items() if call not in answered]
+    return [call for key, call in calls.items() if key not in answered]
 
 
-def pending_write_paths(transcript: str, file: str) -> list:
-    """Targets of the session's unanswered file tool calls for `file`, from
-    its transcript and its subagents' (a subagent's write asks in the same
-    tab). This is the tool call Claude is asking permission for, recorded
-    by Claude before it asks, so unlike screen text it names the real
-    target."""
-    if not transcript or not file:
+def pending_tool_calls(transcript: str) -> list:
+    """Every unanswered tool call (name, file_path) in the session's
+    transcript and its recently active subagents' (a subagent's call asks
+    in the same tab). Claude records a call before asking permission for
+    it, so this names the real action, unlike screen text."""
+    if not transcript:
         return []
     files = [transcript]
     subagents = os.path.join(os.path.splitext(transcript)[0], "subagents")
@@ -1730,8 +1846,16 @@ def pending_write_paths(transcript: str, file: str) -> list:
         pass
     found = []
     for path in files:
-        found += _pending_file_calls(path, file)
+        found += _pending_calls(path)
     return found
+
+
+def pending_write_paths(transcript: str, file: str) -> list:
+    """Targets of the session's unanswered file tool calls for `file`."""
+    if not file:
+        return []
+    return [path for name, path, _command in pending_tool_calls(transcript)
+            if name in FILE_TOOLS and path and os.path.basename(path) == file]
 
 
 _SESSION_INFO: dict = {}
@@ -1780,13 +1904,17 @@ def handle_prompt(cfg: Config, watcher: Watcher, tail: str, prompt) -> None:
         watcher.prompt_since = now
         watcher.prompt_reported = False
         watcher.prompt_attempts = 0
+        # Look again just after the quiet period instead of a full poll
+        # later, so a covered prompt is answered in seconds.
+        watcher.prompt_recheck_at = now + PROMPT_QUIET_SECONDS + 1
         return
     if now - watcher.prompt_since < PROMPT_QUIET_SECONDS:
         return
     profile = watcher.profile
     cwd, transcript = session_info(watcher.surface)
     rule, reason = prompt_rule_for(profile, prompt, cwd,
-                                   pending=lambda name: pending_write_paths(transcript, name))
+                                   pending=lambda name: pending_write_paths(transcript, name),
+                                   pending_any=lambda: pending_tool_calls(transcript))
     blocked = ""
     if not rule:
         blocked = reason
@@ -1794,12 +1922,11 @@ def handle_prompt(cfg: Config, watcher: Watcher, tail: str, prompt) -> None:
         blocked = "prompt answering is off for this agent"
     elif is_ignored(cfg.ignore_rules, watcher.surface, watcher.title):
         blocked = "session is excluded"
-    if not rule and fp not in watcher.near_misses and any(
-            isinstance(r.get("question"), str) and re.search(r["question"], question)
-            for r in profile.rules.get("prompt_rules", [])):
-        # The question is one a rule answers, but its file check refused:
-        # either a real non-memory file or a screen shape we don't parse.
-        # Keep the screen so it can be checked and, if needed, fixed.
+    mentions_memory = file.endswith(".md") or "/memory/" in _unwrap(prompt[2][-30:] + list(prompt[3]))
+    if not rule and fp not in watcher.near_misses and mentions_memory:
+        # A prompt about a markdown file or a memory folder that no rule
+        # answered: a real non-memory file, or a question or screen shape
+        # the rules don't cover yet. Keep the screen so it can become a rule.
         watcher.near_misses.add(fp)
         capture = save_near_miss(watcher.surface, tail)
         log(cfg, f"{watcher.surface}: near miss ({reason}): {question!r} screen={capture}")
@@ -1837,7 +1964,10 @@ def handle_prompt(cfg: Config, watcher: Watcher, tail: str, prompt) -> None:
         # cmux refuses to type into an open question or permission dialog
         # unless told to; answering that dialog is the point here, and the
         # prompt was just re-read and matched.
-        cmux("send", "--force", "--surface", watcher.surface, rule["answer"])
+        answer = rule["answer"]
+        if profile.rules.get("always_allow"):
+            answer = always_allow_answer(prompt[3], _expand_roots(profile.rules.get("memory_roots", []))) or answer
+        cmux("send", "--force", "--surface", watcher.surface, answer)
         time.sleep(1.5)
         after = find_pending_prompt(read_tail(watcher.surface, profile.tail_lines))
     except Exception as exc:
@@ -1846,10 +1976,10 @@ def handle_prompt(cfg: Config, watcher: Watcher, tail: str, prompt) -> None:
     watcher.prompt_answers.setdefault(fp, []).append(now)
     if after and after[0] == question:
         return  # still showing: one more try on the next poll
-    log(cfg, f"{watcher.surface}: answered {rule['answer']!r} to {question!r} ({rule.get('note', '')})")
+    log(cfg, f"{watcher.surface}: answered {answer!r} to {question!r} ({rule.get('note', '')})")
     record(cfg, "prompt_answered", surface=watcher.surface, title=watcher.title,
            workspace=watcher.workspace, question=question[:200], file=file,
-           answer=rule["answer"], waited_s=round(now - watcher.prompt_since, 1))
+           answer=answer, waited_s=round(now - watcher.prompt_since, 1))
     watcher.prompt_fingerprint = ""
 
 
@@ -1987,6 +2117,7 @@ def next_wake(cfg: Config) -> float:
     retried on its backoff schedule without holding the scan for the others."""
     now = time.time()
     due_in = [w.next_action_at - now for w in cfg.watchers.values() if w.next_action_at > now]
+    due_in += [w.prompt_recheck_at - now for w in cfg.watchers.values() if w.prompt_recheck_at > now]
     if not due_in:
         return cfg.interval
     return max(1.0, min(cfg.interval, min(due_in)))
