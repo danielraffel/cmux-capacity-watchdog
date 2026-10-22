@@ -285,6 +285,33 @@ class ClaudeRecoveryTest(unittest.TestCase):
         self.assertGreater(watcher.last_seen_busy, time.time() - 5)
 
 
+class DiscoveryTest(unittest.TestCase):
+    def test_every_pane_of_every_window_is_enumerated(self):
+        """list-pane-surfaces covers only the focused pane by default; a
+        session in another split must still be found."""
+        win = "0503D542-8DD4-46AE-AC89-2ED6D8FDD4F5"
+        ws = "96389D8B-C20F-4275-A7C5-4CA0168E6D50"
+        pane_a, pane_b = "37C4C011-D7C7-4FF0-AD45-D3287CA29676", "FD6E4B15-A2D7-448C-A7A4-80EF1D356655"
+        hidden, focused = "CF63DDFF-AE5D-4E01-8080-C9E8A4459785", "738F16E8-61EB-4EFA-A651-9E5B5B8E6E1F"
+
+        def fake(*args, cli=""):
+            if args[0] == "list-windows":
+                return f"  0: {win} selected_workspace={ws} workspaces=1\n"
+            if args[0] == "list-workspaces":
+                return '{"workspaces": [{"id": "%s"}]}' % ws
+            if args[0] == "list-panes":
+                return f"  pane:1 {pane_a}  [2 surfaces]\n* pane:2 {pane_b}  [1 surfaces]  [focused]\n"
+            if args[0] == "list-pane-surfaces":
+                pane = args[args.index("--pane") + 1] if "--pane" in args else pane_b
+                sid = hidden if pane == pane_a else focused
+                return f"* surface:1 {sid}  pulp  [selected]\n"
+            raise AssertionError(args)
+
+        with mock.patch.object(watchdog, "cmux", fake):
+            found = [sid for sid, _ in watchdog.app_surfaces("cli")]
+        self.assertEqual(sorted(found), sorted([hidden, focused]))
+
+
 class RulesFileTest(unittest.TestCase):
     def setUp(self):
         import tempfile

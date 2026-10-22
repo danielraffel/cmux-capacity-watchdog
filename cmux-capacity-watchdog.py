@@ -69,7 +69,7 @@ DRY_RUN = False
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-10-21.1"
+WATCHDOG_VERSION = "2026-10-21.2"
 
 # Per-agent rules: how to recognise the agent's screen, when it is busy, what
 # its composer looks like, which on-screen errors are resume evidence, and
@@ -1019,48 +1019,73 @@ def discover_surfaces(cfg: Config, witnesses: dict) -> None:
         discover_app(cfg, witnesses, cli)
 
 
-def discover_app(cfg: Config, witnesses: dict, cli: str) -> None:
+UUID_RE = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
+
+
+def app_surfaces(cli: str) -> list:
+    """Every (surface id, title) in one app: windows -> workspaces -> panes
+    -> surfaces. list-pane-surfaces covers only the focused pane unless
+    asked for each pane, so split layouts need the pane pass."""
     try:
-        raw = cmux("list-workspaces", "--json", "--id-format", "both", cli=cli)
+        windows = [line.split()[1] for line in cmux("list-windows", cli=cli).splitlines()
+                   if len(line.split()) > 1 and UUID_RE.fullmatch(line.split()[1])]
+    except Exception:
+        windows = []
+    workspace_ids = []
+    for window in windows or [None]:
+        extra = ("--window", window) if window else ()
+        raw = cmux("list-workspaces", "--json", "--id-format", "both", *extra, cli=cli)
         data = json.loads(raw)
         workspaces = data if isinstance(data, list) else data.get("workspaces", [])
-    except Exception as exc:
-        log(cfg, f"discovery: list-workspaces failed via {cli}: {exc}")
-        return
+        workspace_ids += [w.get("id") for w in workspaces if w.get("id")]
     surface_re = re.compile(r"surface:\d+\s+([0-9A-Fa-f-]{36})\s*(.*)")
-    for workspace in workspaces:
-        wid = workspace.get("id")
-        if not wid:
-            continue
+    found = []
+    for wid in dict.fromkeys(workspace_ids):
         try:
-            listing = cmux("list-pane-surfaces", "--workspace", wid, "--id-format", "both", cli=cli)
+            panes = UUID_RE.findall(cmux("list-panes", "--workspace", wid, "--id-format", "both", cli=cli))
         except Exception:
-            continue
-        for sid, title in surface_re.findall(listing):
-            title = title.replace("[selected]", "").strip()
-            SURFACE_CLI[sid] = cli
+            panes = []
+        for pane in panes or [None]:
+            extra = ("--pane", pane) if pane else ()
             try:
-                tail = read_tail(sid, lines=DISCOVERY_LINES)
+                listing = cmux("list-pane-surfaces", "--workspace", wid, *extra, "--id-format", "both", cli=cli)
             except Exception:
                 continue
-            agent = detect_agent(tail, PROFILES)
-            existing = cfg.watchers.get(sid)
-            if existing:
-                if agent and agent != existing.agent and not screen_matches(existing.profile, tail) \
-                        and not existing.pending and existing.actions_on_stop == 0:
-                    log(cfg, f"discovery: {sid} now runs {agent} (was {existing.agent})")
-                    record(cfg, "agent_changed", surface=sid, agent=agent, previous=existing.agent)
-                    cfg.watchers[sid] = Watcher(surface=sid, title=title, agent=agent,
-                                                last_seen_busy=0.0)
-                continue
-            if not agent:
-                continue
-            if is_ignored(cfg.ignore_rules, sid, title):
-                log(cfg, f"discovery: ignoring excluded session {sid} ({title})")
-                continue
-            cfg.watchers[sid] = Watcher(surface=sid, title=title, agent=agent,
-                                        last_seen_busy=witnesses.get(sid, 0.0))
-            log(cfg, f"discovery: now watching {agent} session {sid} ({title})")
+            found += surface_re.findall(listing)
+    return found
+
+
+def discover_app(cfg: Config, witnesses: dict, cli: str) -> None:
+    try:
+        surfaces = app_surfaces(cli)
+    except Exception as exc:
+        log(cfg, f"discovery: listing failed via {cli}: {exc}")
+        return
+    for sid, title in surfaces:
+        title = title.replace("[selected]", "").strip()
+        SURFACE_CLI[sid] = cli
+        try:
+            tail = read_tail(sid, lines=DISCOVERY_LINES)
+        except Exception:
+            continue
+        agent = detect_agent(tail, PROFILES)
+        existing = cfg.watchers.get(sid)
+        if existing:
+            if agent and agent != existing.agent and not screen_matches(existing.profile, tail) \
+                    and not existing.pending and existing.actions_on_stop == 0:
+                log(cfg, f"discovery: {sid} now runs {agent} (was {existing.agent})")
+                record(cfg, "agent_changed", surface=sid, agent=agent, previous=existing.agent)
+                cfg.watchers[sid] = Watcher(surface=sid, title=title, agent=agent,
+                                            last_seen_busy=0.0)
+            continue
+        if not agent:
+            continue
+        if is_ignored(cfg.ignore_rules, sid, title):
+            log(cfg, f"discovery: ignoring excluded session {sid} ({title})")
+            continue
+        cfg.watchers[sid] = Watcher(surface=sid, title=title, agent=agent,
+                                    last_seen_busy=witnesses.get(sid, 0.0))
+        log(cfg, f"discovery: now watching {agent} session {sid} ({title})")
 
 
 def report(stats_file: str) -> int:
