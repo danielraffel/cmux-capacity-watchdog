@@ -25,6 +25,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -32,36 +33,221 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
-CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
+# The cmux CLIs. Each CLI talks only to its own app, and the release and
+# nightly apps can run side by side, so every running app is enumerated
+# through its own CLI and each surface remembers which CLI owns it.
+# CMUX_BIN pins a single CLI.
+CMUX_CANDIDATES = (
+    "/Applications/cmux NIGHTLY.app/Contents/Resources/bin/cmux",
+    "/Applications/cmux.app/Contents/Resources/bin/cmux",
+)
+
+
+def running_clis() -> list:
+    """CLIs whose app is running (ps, not pgrep: pgrep misses some app
+    processes); every installed CLI when none is detectably running."""
+    override = os.environ.get("CMUX_BIN")
+    if override:
+        return [override]
+    installed = [path for path in CMUX_CANDIDATES if os.path.exists(path)]
+    try:
+        commands = subprocess.run(["/bin/ps", "-axo", "command"], capture_output=True,
+                                  text=True, timeout=10).stdout.splitlines()
+    except Exception:
+        commands = []
+    running = [path for path in installed
+               if any(line.startswith(path.split("/Contents/", 1)[0] + "/Contents/MacOS/cmux")
+                      for line in commands)]
+    return running or installed or [CMUX_CANDIDATES[-1]]
+
+
+CMUX = running_clis()[0]
+SURFACE_CLI = {}  # surface id -> the CLI of the app that owns it
+# --dry-run: no keystroke ever reaches a tab, whichever code path asks.
+DRY_RUN = False
 
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-09-20.5"
+WATCHDOG_VERSION = "2026-10-21.1"
 
-# A turn is running when any of these appear in the tail.
-BUSY_MARKERS = ("esc to interrupt",)
-# The goal is paused. Codex words it "Goal stalled (/goal resume)"; Kimi and
-# others say "goal paused".
-GOAL_PAUSED_MARKERS = ("goal paused", "goal stalled")
-# The turn died on a transient provider problem worth retrying. User interrupts
-# (Esc) and clean completions never match these. Deliberately narrow: the Codex
-# model-capacity family plus the observed stream disconnect. Grow this list
-# from the excerpts captured in stats, never speculatively.
-CAPACITY_MARKERS = (
-    "selected model is at capacity",
-    "model is at capacity",
-    "server_is_overloaded",
-    "servers are currently overloaded",
-    "stream disconnected before completion",
-)
-# Known empty-composer placeholders by client.
-COMPOSER_PLACEHOLDERS = ("ask codex to do anything", "ask kimi", "type a message", "ask anything")
+# Per-agent rules: how to recognise the agent's screen, when it is busy, what
+# its composer looks like, which on-screen errors are resume evidence, and
+# what to type. Everything an operator tunes lives here, and the rules file
+# (RULES_FILE) can replace or extend any key without a code change or a
+# restart. Grow evidence lists from the excerpts captured in stats, never
+# speculatively.
+DEFAULT_PROFILES = {
+    "codex": {
+        "enabled": True,
+        # A surface counts as a Codex session when its composer placeholder or
+        # model slug is visible. Works on busy turns too.
+        "detect_contains": ["ask codex to do anything", "gpt-"],
+        "prompt_glyph": "›",
+        "composer_needs_border": False,
+        # Known empty-composer placeholders by client.
+        "placeholders": ["ask codex to do anything", "ask kimi", "type a message", "ask anything"],
+        # A turn is running when any of these appear in the evidence window.
+        "busy_contains": ["esc to interrupt"],
+        "busy_regex": [],
+        "retrying_regex": [],
+        # Codex words it "Goal stalled (/goal resume)"; Kimi and others say
+        # "goal paused".
+        "goal_paused_contains": ["goal paused", "goal stalled"],
+        "goal_command": "/goal resume",
+        "continue_command": "continue",
+        "stall_contains": "pursuing goal",
+        # The current stop's error sits just above the composer; the last
+        # few raw lines are the evidence window.
+        "evidence": "tail",
+        # Transient provider problems worth retrying. User interrupts (Esc)
+        # and clean completions never match these.
+        "evidence_contains": [
+            "selected model is at capacity",
+            "model is at capacity",
+            "server_is_overloaded",
+            "servers are currently overloaded",
+            "stream disconnected before completion",
+        ],
+        "evidence_regex": [],
+        # Fast attempts before the slow lane, and the slow lane's spacing.
+        "fast_attempts": 12,
+        "slow_lane_interval": 300,
+        "tail_lines": 30,
+    },
+    "claude": {
+        "enabled": True,
+        # Claude Code draws its composer as a "❯" line between two rules. Its
+        # selection dialogs also use "❯" but never inside the rules.
+        "detect_contains": [],
+        "detect_composer": True,
+        "prompt_glyph": "❯",
+        "composer_needs_border": True,
+        "placeholders": ["press up to edit queued messages", "try \""],
+        "busy_contains": ["esc to interrupt"],
+        # The spinner line: a glyph, a verb and an ellipsis ("· Envisioning…").
+        # A finished turn reads "✻ Baked for 2m 57s · done", with no ellipsis.
+        "busy_regex": [r"^\s*[·✢✳✶✻✽*]\s+\S+…"],
+        # Claude's own retry loop. Not a running turn (a resume that only
+        # reached this state did not work) and not a busy witness.
+        "retrying_regex": [r"retrying in \d+s · attempt \d+/\d+"],
+        "goal_paused_contains": [],
+        "goal_command": "",
+        "continue_command": "continue",
+        "stall_contains": "",
+        # Full-screen Claude leaves blank lines between the transcript and the
+        # composer, so the raw tail can miss the error entirely. Evidence is
+        # the last transcript block above the composer: Claude's final
+        # message must itself be the error. An old error followed by a
+        # normal reply never qualifies.
+        "evidence": "last_block",
+        "block_glyphs": ["⏺", "●"],
+        "evidence_contains": [],
+        "evidence_regex": [
+            r"^[⏺●] API Error: 5\d\d\b",
+            r"^[⏺●] API Error: .*overloaded",
+            r"^[⏺●] API Error: (Connection lost|The response stopped arriving|Your computer went to sleep)",
+            r"^[⏺●] (API Error: )?Request timed out",
+        ],
+        # Claude already retries ten times internally before it shows the
+        # error, so a few fast attempts, then a gentle slow lane.
+        "fast_attempts": 3,
+        "slow_lane_interval": 900,
+        # Full-screen Claude can sit its last message far above the composer
+        # in a tall window with a short transcript.
+        "tail_lines": 80,
+    },
+}
 
-# A surface counts as a Codex session when its composer placeholder or model
-# slug is visible. Works on busy turns too — the placeholder stays on screen.
-CODEX_SESSION_MARKERS = ("ask codex to do anything", "gpt-")
-DISCOVERY_INTERVAL = 300.0  # seconds between scans for new Codex sessions
+# Operator overrides, re-read on every cycle. Shape:
+#   {"agents": {"claude": {"evidence_regex_add": ["..."], "enabled": true},
+#               "codex":  {"slow_lane_interval": 600}}}
+# A key replaces the default; a "<key>_add" key appends to a list default.
+# A malformed file keeps the last good rules and says so in the log.
+RULES_FILE = os.path.expanduser("~/.config/cmux-capacity-watchdog/rules.json")
+
+DISCOVERY_INTERVAL = 300.0  # seconds between scans for new sessions
+# Enough lines for the Claude composer frame plus its footer and status line.
+DISCOVERY_LINES = 14
+
+
+@dataclass
+class Profile:
+    name: str
+    rules: dict
+
+    def __getattr__(self, key):
+        try:
+            return self.__dict__["rules"][key]
+        except KeyError:
+            raise AttributeError(key) from None
+
+    def matches_any(self, text: str, contains_key: str, regex_key: str) -> str:
+        """Return the first matching marker (contains, then regex), or ""."""
+        lowered = text.lower()
+        for marker in self.rules.get(contains_key, []):
+            if marker in lowered:
+                return marker
+        for pattern in self.rules.get(regex_key, []):
+            for line in text.splitlines():
+                if re.search(pattern, line.strip(), re.IGNORECASE):
+                    return pattern
+        return ""
+
+
+def build_profiles(overrides: dict) -> dict:
+    profiles = {}
+    for name, defaults in DEFAULT_PROFILES.items():
+        rules = {key: (list(value) if isinstance(value, list) else value) for key, value in defaults.items()}
+        for key, value in (overrides.get(name) or {}).items():
+            if key.endswith("_add") and isinstance(rules.get(key[:-4]), list):
+                rules[key[:-4]].extend(value)
+            else:
+                rules[key] = value
+        profiles[name] = Profile(name=name, rules=rules)
+    return profiles
+
+
+class RulesLoader:
+    """Reload RULES_FILE when it changes; keep the last good rules otherwise."""
+
+    def __init__(self, path: str = RULES_FILE):
+        self.path = path
+        self.mtime = None
+        self.profiles = build_profiles({})
+        self.error = ""
+
+    def load(self, log_fn=print) -> dict:
+        try:
+            mtime = os.stat(self.path).st_mtime
+        except FileNotFoundError:
+            if self.mtime is not None:
+                log_fn(f"rules file removed; using built-in rules")
+                self.profiles, self.mtime = build_profiles({}), None
+            return self.profiles
+        except OSError as exc:
+            log_fn(f"WARNING: rules file unreadable ({exc}); keeping the last good rules")
+            return self.profiles
+        if mtime == self.mtime:
+            return self.profiles
+        self.mtime = mtime
+        try:
+            with open(self.path) as handle:
+                data = json.load(handle)
+            agents = data.get("agents", {})
+            for pattern in (p for rules in agents.values() for key, value in rules.items()
+                            if "regex" in key for p in value):
+                re.compile(pattern)
+            self.profiles = build_profiles(agents)
+            self.error = ""
+            log_fn(f"rules loaded from {self.path}")
+        except Exception as exc:
+            self.error = str(exc)
+            log_fn(f"WARNING: rules file invalid ({exc}); keeping the last good rules")
+        return self.profiles
+
+
+PROFILES = build_profiles({})
 
 # A stop is only resume-eligible when the watchdog personally saw the surface
 # busy recently — a transition it witnessed. A session discovered already
@@ -148,10 +334,23 @@ VERIFY_WAIT = 4.0
 ORPHAN_ENTER_MAX = 3            # bounded Enter retries for a composer draft that exactly matches the resume command
 
 
-def cmux(*args: str) -> str:
-    result = subprocess.run([CMUX, *args], capture_output=True, text=True, timeout=30)
-    if result.returncode != 0:
-        raise RuntimeError(f"cmux {' '.join(args)}: {result.stderr.strip()}")
+def cmux(*args: str, cli: str = "") -> str:
+    """Run a cmux CLI command. A --surface command goes to the CLI of the app
+    that owns that surface. A CLI that answers with an error message (some
+    builds exit 0 with "Error: ..." for an unknown surface) raises, so a
+    wrong-app read can never pass for an idle screen."""
+    if DRY_RUN and args and args[0] in ("send", "send-key"):
+        return ""
+    if not cli and "--surface" in args:
+        cli = SURFACE_CLI.get(args[args.index("--surface") + 1], "")
+    # An inherited socket path steers any CLI to one app's socket; each CLI
+    # must reach its own app, as it does under launchd. Credentials
+    # (CMUX_SOCKET_PASSWORD, a capability) pass through.
+    env = {key: value for key, value in os.environ.items() if key not in ("CMUX_SOCKET", "CMUX_SOCKET_PATH")}
+    result = subprocess.run([cli or CMUX, *args], capture_output=True, text=True, timeout=30, env=env)
+    cli_error = result.stdout.startswith("Error: ") and result.stdout.strip().count("\n") == 0
+    if result.returncode != 0 or cli_error:
+        raise RuntimeError(f"cmux {' '.join(args)}: {(result.stderr or result.stdout).strip()}")
     return result.stdout
 
 
@@ -159,19 +358,43 @@ def read_tail(surface: str, lines: int = 30) -> str:
     return cmux("read-screen", "--surface", surface, "--lines", str(lines))
 
 
-def composer_content(tail: str) -> str:
+def is_rule(line: str) -> bool:
+    stripped = line.strip()
+    return len(stripped) >= 20 and set(stripped) == {"─"}
+
+
+def bordered_composer_index(lines: list) -> int:
+    """Index of the last "❯" line framed by horizontal rules above and below
+    (Claude's composer), or -1. Multi-line drafts sit above the lower rule."""
+    for index in range(len(lines) - 1, 0, -1):
+        if lines[index].strip().startswith("❯") and is_rule(lines[index - 1]):
+            if any(is_rule(line) for line in lines[index + 1:index + 8]):
+                return index
+    return -1
+
+
+def composer_lines(tail: str, profile: Profile) -> list:
+    """Composer lines, last first. Codex: every "›" line. Claude: the one
+    framed composer (selection dialogs use "❯" too, never framed)."""
+    lines = tail.splitlines()
+    if profile.composer_needs_border:
+        index = bordered_composer_index(lines)
+        return [lines[index]] if index >= 0 else []
+    return [line for line in reversed(lines) if line.strip().startswith(profile.prompt_glyph)]
+
+
+def composer_content(tail: str, profile: Profile = None) -> str:
     """The text currently in the composer (best-effort, last composer line).
 
     Spinner overlays (braille glyphs, U+2800–U+28FF) can bleed into the
     composer line in a screen read; they are display artifacts, not draft
     text, so strip them before comparing.
     """
-    for line in reversed(tail.splitlines()):
-        stripped = line.strip()
-        if stripped.startswith("›"):
-            content = stripped.lstrip("›").strip()
-            content = "".join(c for c in content if not 0x2800 <= ord(c) <= 0x28FF)
-            return content.strip()
+    profile = profile or PROFILES["codex"]
+    for line in composer_lines(tail, profile):
+        content = line.strip()[len(profile.prompt_glyph):].strip()
+        content = "".join(c for c in content if not 0x2800 <= ord(c) <= 0x28FF)
+        return content.strip()
     return ""
 
 
@@ -183,7 +406,7 @@ class SubmitAmbiguous(Exception):
     """Enter may have landed before the failure — never auto-retry this stop."""
 
 
-def send_literal(surface: str, text: str) -> None:
+def send_literal(surface: str, text: str, profile: Profile = None) -> None:
     """Send control input (slash command or plain prompt) at column zero.
 
     Per the tab-coordination rules: slash commands are client control input and
@@ -194,7 +417,7 @@ def send_literal(surface: str, text: str) -> None:
     """
     cmux("send", "--surface", surface, text)
     time.sleep(1.2)
-    content = composer_content(read_tail(surface))
+    content = composer_content(read_tail(surface), profile)
     if content == text:
         # Residual race: one subprocess call (~100ms) sits between this read
         # and Enter. cmux has no atomic validate-and-submit; the repair path
@@ -216,16 +439,15 @@ def send_literal(surface: str, text: str) -> None:
     raise ComposerContaminated(f"composer changed around our send ({content[:40]!r}); aborted without Enter")
 
 
-def composer_has_text(tail: str) -> bool:
-    for line in tail.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("›"):
-            content = stripped.lstrip("›").strip()
-            if not content:
-                continue
-            if any(content.lower().startswith(p) for p in COMPOSER_PLACEHOLDERS):
-                continue
-            return True
+def composer_has_text(tail: str, profile: Profile = None) -> bool:
+    profile = profile or PROFILES["codex"]
+    for line in composer_lines(tail, profile):
+        content = line.strip()[len(profile.prompt_glyph):].strip()
+        if not content:
+            continue
+        if any(content.lower().startswith(p) for p in profile.placeholders):
+            continue
+        return True
     return False
 
 
@@ -234,32 +456,103 @@ def composer_has_text(tail: str) -> bool:
 # scrollback qualify as evidence for a stop that happened hours later (e.g. a
 # deliberate pause long after a capacity error), so only the last lines count.
 EVIDENCE_LINES = 12
+# Claude: how many non-empty transcript lines above the composer to inspect
+# for the spinner and the final message block.
+TRANSCRIPT_LINES = 8
 
 
-def classify(tail: str) -> tuple:
+def transcript_above_composer(tail: str) -> list:
+    """Non-empty lines between the transcript and Claude's framed composer,
+    oldest first, with the composer's upper rule excluded."""
+    lines = tail.splitlines()
+    index = bordered_composer_index(lines)
+    if index < 0:
+        return []
+    above = [line for line in lines[:index - 1] if line.strip()]
+    return above[-TRANSCRIPT_LINES:]
+
+
+def last_block(lines: list, glyphs: list) -> str:
+    """The last transcript block that starts with one of the message glyphs,
+    joined with its continuation lines. Status lines (✻ …, ⎿ tips) end it.
+    A user prompt ("❯ …") after the last message means the user has spoken
+    since, so there is no current agent message and the result is ""."""
+    for start in range(len(lines) - 1, -1, -1):
+        if lines[start].strip().startswith("❯"):
+            return ""
+        if any(lines[start].strip().startswith(g) for g in glyphs):
+            block = [lines[start].strip()]
+            for line in lines[start + 1:]:
+                if not line.startswith("  ") or line.strip()[:1] in ("✻", "⎿", "❯"):
+                    break
+                block.append(line.strip())
+            return " ".join(block)
+    return ""
+
+
+def classify(tail: str, profile: Profile = None) -> tuple:
     """Return (state, matched_marker). The marker is recorded in stats so we
     can see which failure signatures dominate and which we miss."""
-    lowered = "\n".join(tail.splitlines()[-EVIDENCE_LINES:]).lower()
-    if any(marker in lowered for marker in BUSY_MARKERS):
+    profile = profile or PROFILES["codex"]
+    window = "\n".join(tail.splitlines()[-EVIDENCE_LINES:])
+    if profile.evidence == "last_block":
+        transcript = transcript_above_composer(tail)
+        status = "\n".join(transcript[-3:] + [window])
+        if profile.matches_any(status, "", "retrying_regex"):
+            return "retrying", ""
+        if profile.matches_any(window, "busy_contains", "") or \
+                profile.matches_any("\n".join(transcript[-3:]), "", "busy_regex"):
+            return "busy", ""
+        block = last_block(transcript, profile.block_glyphs)
+        marker = profile.matches_any(block, "evidence_contains", "evidence_regex") if block else ""
+        if marker:
+            return "capacity-stopped", marker
+        return "idle", ""
+    lowered = window.lower()
+    if profile.matches_any(window, "busy_contains", "busy_regex"):
         return "busy", ""
-    for marker in GOAL_PAUSED_MARKERS:
+    if profile.matches_any(window, "", "retrying_regex"):
+        return "retrying", ""
+    for marker in profile.goal_paused_contains:
         if marker in lowered:
             # A paused goal is only a candidate when a transient error is
             # visible too — users pause goals deliberately all the time, and
             # a deliberate pause has no error text on screen.
-            for cap in CAPACITY_MARKERS:
-                if cap in lowered:
-                    return "goal-paused", cap
+            cap = profile.matches_any(window, "evidence_contains", "evidence_regex")
+            if cap:
+                return "goal-paused", cap
             return "goal-paused-no-error", marker
-    for marker in CAPACITY_MARKERS:
-        if marker in lowered:
-            return "capacity-stopped", marker
-    if "pursuing goal" in lowered:
+    marker = profile.matches_any(window, "evidence_contains", "evidence_regex")
+    if marker:
+        return "capacity-stopped", marker
+    if profile.stall_contains and profile.stall_contains in lowered:
         # Footer claims an active goal but no turn is running: a silent stall
         # the client never surfaced as an error. Needs persistence across
         # polls before acting (between-turn gaps are seconds).
         return "goal-stalled-candidate", "pursuing goal (idle)"
     return "idle", ""
+
+
+def screen_matches(profile: Profile, tail: str) -> bool:
+    if profile.rules.get("detect_composer") and bordered_composer_index(tail.splitlines()) >= 0:
+        return True
+    lowered = tail.lower()
+    return any(marker in lowered for marker in profile.detect_contains)
+
+
+def detect_agent(tail: str, profiles: dict) -> str:
+    """Which enabled agent this screen belongs to, or "". Claude's framed
+    composer is checked first: it is structural, while the Codex markers are
+    plain text that a Claude transcript could quote."""
+    lines = tail.splitlines()
+    for name, profile in profiles.items():
+        if profile.enabled and profile.rules.get("detect_composer") and bordered_composer_index(lines) >= 0:
+            return name
+    lowered = tail.lower()
+    for name, profile in profiles.items():
+        if profile.enabled and any(marker in lowered for marker in profile.detect_contains):
+            return name
+    return ""
 
 
 def tail_excerpt(tail: str, limit: int = 300) -> str:
@@ -286,6 +579,7 @@ def fingerprint(state: str, marker: str, tail: str) -> str:
 class Watcher:
     surface: str
     title: str = ""
+    agent: str = "codex"
     last_fingerprint: str = ""
     actions_on_stop: int = 0
     next_action_at: float = 0.0
@@ -298,6 +592,10 @@ class Watcher:
     marker_seen: str = ""   # the error marker instance currently on screen
     skip_logged: bool = False  # stale/deliberate skips log once per stop episode
     orphan_enters: int = 0  # Enter presses on a composer draft that exactly matches the resume command
+
+    @property
+    def profile(self) -> Profile:
+        return PROFILES[self.agent]
 
 
 @dataclass
@@ -322,6 +620,9 @@ def record(cfg: Config, event: str, **fields) -> None:
     """Append one structured stats event as a JSON line; never blocks the loop."""
     if not cfg.stats_file:
         return
+    watcher = cfg.watchers.get(fields.get("surface", ""))
+    if watcher and "agent" not in fields:
+        fields["agent"] = watcher.agent
     payload = {"ts": datetime.now().isoformat(timespec="seconds"),
                "host": socket.gethostname(), "v": WATCHDOG_VERSION, "event": event, **fields}
     try:
@@ -338,7 +639,7 @@ def notify(title: str, body: str) -> None:
         pass
 
 
-def verify_resumed(surface: str) -> tuple:
+def verify_resumed(surface: str, profile: Profile = None) -> tuple:
     """Check over ~16s whether a turn started; return (confirmed, post-state,
     post-tail) so failures keep their evidence. Codex can take well over a few
     seconds to show a running turn after /goal resume — a short window here
@@ -347,8 +648,8 @@ def verify_resumed(surface: str) -> tuple:
     state, tail = "", ""
     for attempt in range(4):
         time.sleep(VERIFY_WAIT)
-        tail = read_tail(surface)
-        state, _ = classify(tail)
+        tail = read_tail(surface, profile.tail_lines if profile else 30)
+        state, _ = classify(tail, profile)
         if state == "busy":
             return True, state, tail
     return False, state, tail
@@ -375,7 +676,7 @@ def send_once(cfg: Config, watcher: Watcher, command: str, state: str, marker: s
            state=state, marker=marker, command=command, attempt=watcher.actions_on_stop, lane=lane)
     now = time.time()
     try:
-        send_literal(watcher.surface, command)
+        send_literal(watcher.surface, command, watcher.profile)
         # Our send may change the session state; a stop observed after it
         # counts as new evidence even if the on-screen marker text is identical.
         watcher.marker_seen = ""
@@ -408,7 +709,7 @@ def send_once(cfg: Config, watcher: Watcher, command: str, state: str, marker: s
         record(cfg, "send_error", surface=watcher.surface, command=command, error=str(exc))
         watcher.marker_seen = ""
         return "error"
-    confirmed, post_state, post_tail = verify_resumed(watcher.surface)
+    confirmed, post_state, post_tail = verify_resumed(watcher.surface, watcher.profile)
     if confirmed:
         # Clear any stale pending from an earlier unconfirmed send, or the
         # next busy sighting would credit it again as a late confirmation.
@@ -494,7 +795,7 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
         # human is engaged, so defer.
         if now < watcher.next_action_at:
             return
-        content = composer_content(tail)
+        content = composer_content(tail, watcher.profile)
         if content == pending["command"]:
             log(cfg, f"{watcher.surface}: ambiguous send left our command untouched in the composer; pressing Enter")
             record(cfg, "ambiguous_retry", surface=watcher.surface, title=watcher.title,
@@ -509,7 +810,7 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
             time.sleep(1.0)
             # The composer is the witness again: if our command still sits
             # there, Enter did not take and the stop is still ambiguous.
-            if composer_content(read_tail(watcher.surface)) == pending["command"]:
+            if composer_content(read_tail(watcher.surface), watcher.profile) == pending["command"]:
                 pending["retries"] = pending.get("retries", 0) + 1
                 if pending["retries"] >= 3:
                     log(cfg, f"{watcher.surface}: Enter never takes on this session; leaving it for a human")
@@ -528,7 +829,7 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
             watcher.pending = {"command": pending["command"], "attempt": pending["attempt"],
                                "lane": pending["lane"], "sent_at": now,
                                "stop_since": pending["stop_since"]}
-            confirmed, post_state, _post_tail = verify_resumed(watcher.surface)
+            confirmed, post_state, _post_tail = verify_resumed(watcher.surface, watcher.profile)
             if confirmed:
                 elapsed = round(now - pending["stop_since"], 1) if pending["stop_since"] else None
                 log(cfg, f"{watcher.surface}: resumed via Enter retry, turn is running")
@@ -542,7 +843,7 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
                    command=pending["command"], attempt=pending["attempt"])
             watcher.next_action_at = now + SLOW_LANE_INTERVAL
             return
-        if composer_has_text(tail):
+        if composer_has_text(tail, watcher.profile):
             log(cfg, f"{watcher.surface}: ambiguous send plus user text in the composer; deferring to the human")
             watcher.next_action_at = now + 120
             return
@@ -598,7 +899,8 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
             record(cfg, "deliberate_pause_skipped", surface=watcher.surface, title=watcher.title,
                    fingerprint=fp, excerpt=tail_excerpt(tail))
         return
-    command = "continue" if state == "capacity-stopped" else "/goal resume"
+    profile = watcher.profile
+    command = profile.continue_command if state == "capacity-stopped" else profile.goal_command
     if new_episode:
         log(cfg, f"{watcher.surface}: stop detected ({state}), evidence {marker!r}")
         # since_busy_s approximates detection lag: the last busy sighting is at
@@ -609,8 +911,8 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
                since_busy_s=round(now - watcher.last_seen_busy, 1) if watcher.last_seen_busy else None)
     if now < watcher.next_action_at:
         return
-    if composer_has_text(tail):
-        content = composer_content(tail)
+    if composer_has_text(tail, watcher.profile):
+        content = composer_content(tail, watcher.profile)
         if content == command and watcher.orphan_enters < ORPHAN_ENTER_MAX:
             # The composer holds exactly the command we would send: either an
             # orphaned watchdog send from before a restart (pending state is
@@ -631,7 +933,7 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
             time.sleep(1.0)
             # The composer is the witness: if the command still sits there,
             # Enter did not take and the stop is still standing.
-            if composer_content(read_tail(watcher.surface)) == command:
+            if composer_content(read_tail(watcher.surface), watcher.profile) == command:
                 if watcher.orphan_enters >= ORPHAN_ENTER_MAX:
                     log(cfg, f"{watcher.surface}: Enter never takes on this session; leaving it for a human")
                     record(cfg, "orphan_enter_gave_up", surface=watcher.surface, title=watcher.title,
@@ -646,7 +948,7 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
             # further sends until the turn appears or the window lapses.
             watcher.pending = {"command": command, "attempt": watcher.actions_on_stop,
                                "lane": "fast", "sent_at": now, "stop_since": watcher.stop_since}
-            confirmed, _post_state, _post_tail = verify_resumed(watcher.surface)
+            confirmed, _post_state, _post_tail = verify_resumed(watcher.surface, watcher.profile)
             if confirmed:
                 elapsed = round(now - watcher.stop_since, 1) if watcher.stop_since else None
                 log(cfg, f"{watcher.surface}: resumed via orphan Enter, turn is running")
@@ -667,7 +969,7 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
         watcher.next_action_at = now + 300
         return
     if cfg.dry_run:
-        lane = "fast" if watcher.actions_on_stop < MAX_ACTIONS_PER_STOP else "slow"
+        lane = "fast" if watcher.actions_on_stop < profile.fast_attempts else "slow"
         log(cfg, f"{watcher.surface}: DRY-RUN would send {command!r} ({lane} lane)")
         return
 
@@ -677,9 +979,9 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
     # others. The fast lane keeps the same 5s→60s exponential spacing the old
     # inline ladder had; after the twelfth attempt the slow lane retries every
     # 5 minutes until the storm passes.
-    if watcher.actions_on_stop >= MAX_ACTIONS_PER_STOP:
+    if watcher.actions_on_stop >= profile.fast_attempts:
         lane = "slow"
-        backoff = SLOW_LANE_INTERVAL
+        backoff = profile.slow_lane_interval
     else:
         lane = "fast"
         backoff = min(FAST_BACKOFF_CAP, 5 * (2 ** watcher.actions_on_stop))
@@ -689,12 +991,12 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
         # Confirmed: nothing to schedule. Error: the error path already set
         # its own retry timing (or parked an ambiguous pending).
         return
-    if watcher.actions_on_stop >= MAX_ACTIONS_PER_STOP and not watcher.parked:
+    if watcher.actions_on_stop >= profile.fast_attempts and not watcher.parked:
         # The fast ladder is spent without a confirmed resume: from the next
         # attempt on, ride out the storm at the slow lane's gentler cadence.
         watcher.parked = True
-        backoff = SLOW_LANE_INTERVAL
-        log(cfg, f"{watcher.surface}: slow lane after {watcher.actions_on_stop} quick attempts; retrying every {SLOW_LANE_INTERVAL // 60}m")
+        backoff = profile.slow_lane_interval
+        log(cfg, f"{watcher.surface}: slow lane after {watcher.actions_on_stop} quick attempts; retrying every {profile.slow_lane_interval // 60}m")
         record(cfg, "slow_lane", surface=watcher.surface, attempts=watcher.actions_on_stop)
         notify("watchdog: session in slow lane", f"{watcher.surface} keeps failing to resume")
     if outcome == "unconfirmed":
@@ -703,22 +1005,27 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
     watcher.next_action_at = now + backoff
 
 
-def discover_codex_surfaces(cfg: Config, witnesses: dict) -> None:
-    """Find every Codex session known to cmux and add it to the watch set.
+def discover_surfaces(cfg: Config, witnesses: dict) -> None:
+    """Find every agent session known to cmux and add it to the watch set.
 
     Enumeration is workspace -> pane surfaces -> a short screen read; the
-    composer placeholder/model slug identifies Codex regardless of the tab
-    title. Discovered surfaces that later vanish are dropped on read errors.
+    screen identifies the agent regardless of the tab title (see
+    detect_agent). A watched surface whose screen now shows a different agent
+    (the user quit Codex and started Claude in the same tab) switches
+    profiles with fresh stop bookkeeping. Discovered surfaces that later
+    vanish are dropped on read errors.
     """
-    import json
-    import re
+    for cli in running_clis():
+        discover_app(cfg, witnesses, cli)
 
+
+def discover_app(cfg: Config, witnesses: dict, cli: str) -> None:
     try:
-        raw = cmux("list-workspaces", "--json", "--id-format", "both")
+        raw = cmux("list-workspaces", "--json", "--id-format", "both", cli=cli)
         data = json.loads(raw)
         workspaces = data if isinstance(data, list) else data.get("workspaces", [])
     except Exception as exc:
-        log(cfg, f"discovery: list-workspaces failed: {exc}")
+        log(cfg, f"discovery: list-workspaces failed via {cli}: {exc}")
         return
     surface_re = re.compile(r"surface:\d+\s+([0-9A-Fa-f-]{36})\s*(.*)")
     for workspace in workspaces:
@@ -726,24 +1033,34 @@ def discover_codex_surfaces(cfg: Config, witnesses: dict) -> None:
         if not wid:
             continue
         try:
-            listing = cmux("list-pane-surfaces", "--workspace", wid, "--id-format", "both")
+            listing = cmux("list-pane-surfaces", "--workspace", wid, "--id-format", "both", cli=cli)
         except Exception:
             continue
         for sid, title in surface_re.findall(listing):
-            if sid in cfg.watchers:
-                continue
+            title = title.replace("[selected]", "").strip()
+            SURFACE_CLI[sid] = cli
             try:
-                tail = read_tail(sid, lines=8)
+                tail = read_tail(sid, lines=DISCOVERY_LINES)
             except Exception:
                 continue
-            lowered = tail.lower()
-            if any(marker in lowered for marker in CODEX_SESSION_MARKERS):
-                if is_ignored(cfg.ignore_rules, sid, title.strip()):
-                    log(cfg, f"discovery: ignoring excluded session {sid} ({title.strip()})")
-                    continue
-                cfg.watchers[sid] = Watcher(surface=sid, title=title.strip(),
-                                            last_seen_busy=witnesses.get(sid, 0.0))
-                log(cfg, f"discovery: now watching Codex session {sid} ({title.strip()})")
+            agent = detect_agent(tail, PROFILES)
+            existing = cfg.watchers.get(sid)
+            if existing:
+                if agent and agent != existing.agent and not screen_matches(existing.profile, tail) \
+                        and not existing.pending and existing.actions_on_stop == 0:
+                    log(cfg, f"discovery: {sid} now runs {agent} (was {existing.agent})")
+                    record(cfg, "agent_changed", surface=sid, agent=agent, previous=existing.agent)
+                    cfg.watchers[sid] = Watcher(surface=sid, title=title, agent=agent,
+                                                last_seen_busy=0.0)
+                continue
+            if not agent:
+                continue
+            if is_ignored(cfg.ignore_rules, sid, title):
+                log(cfg, f"discovery: ignoring excluded session {sid} ({title})")
+                continue
+            cfg.watchers[sid] = Watcher(surface=sid, title=title, agent=agent,
+                                        last_seen_busy=witnesses.get(sid, 0.0))
+            log(cfg, f"discovery: now watching {agent} session {sid} ({title})")
 
 
 def report(stats_file: str) -> int:
@@ -796,6 +1113,11 @@ def report(stats_file: str) -> int:
         v_unconf = sum(1 for e in vevents if e.get("event") == "resume_unconfirmed")
         print(f"  v{version}: {vevents[0].get('ts', '?')} → {vevents[-1].get('ts', '?')} — "
               f"{v_stops} stops, {v_actions} actions, {v_resumed} resumed, {v_unconf} unconfirmed")
+    agents = sorted({e.get("agent", "codex") for e in stops + resumed})
+    if len(agents) > 1 or agents != ["codex"]:
+        print("by agent: " + ", ".join(
+            f"{agent} {sum(1 for e in stops if e.get('agent', 'codex') == agent)} stops / "
+            f"{sum(1 for e in resumed if e.get('agent', 'codex') == agent)} resumed" for agent in agents))
     print(f"stops detected: {len(stops)}")
     by_state = {}
     for e in stops:
@@ -894,8 +1216,24 @@ def poll_surface(cfg: Config, watcher: Watcher, pinned: set) -> bool:
     True when witnessed-busy state changed and needs persisting.
     """
     try:
-        tail = read_tail(watcher.surface)
-        state, marker = classify(tail)
+        tail = read_tail(watcher.surface, watcher.profile.tail_lines)
+        state, marker = classify(tail, watcher.profile)
+        if state == "retrying":
+            # The agent is retrying on its own. That is neither a running
+            # turn (a resume that only got this far did not work, so a
+            # pending send stays unconfirmed) nor a stop. It is a witness
+            # only when the user's own turn started it: a quota failure
+            # spends a second on the spinner and minutes retrying, so the
+            # poll rarely sees "busy". Retries after our own sends never
+            # refresh the witness, or a long outage would loop for days
+            # instead of ending at the witness window.
+            if watcher.actions_on_stop == 0 and not watcher.pending:
+                if watcher.last_seen_busy == 0:
+                    record(cfg, "witnessed_busy", surface=watcher.surface, title=watcher.title,
+                           via="retrying")
+                watcher.last_seen_busy = time.time()
+                return True
+            return False
         if state == "busy":
             watcher.marker_seen = ""
             confirm_pending(cfg, watcher)
@@ -908,6 +1246,18 @@ def poll_surface(cfg: Config, watcher: Watcher, pinned: set) -> bool:
             watcher.parked = False
             watcher.stalled_polls = 0
             watcher.orphan_enters = 0
+            return True
+        if state == "idle" and watcher.pending and watcher.profile.evidence == "last_block" \
+                and last_block(transcript_above_composer(tail), watcher.profile.block_glyphs):
+            # Claude settled after our send with a new final message that is
+            # not an error, and no prompt from the user since: the resume
+            # worked, in a turn short enough to finish between polls.
+            confirm_pending(cfg, watcher)
+            watcher.marker_seen = ""
+            watcher.last_seen_busy = time.time()
+            watcher.last_fingerprint = ""
+            watcher.actions_on_stop = 0
+            watcher.parked = False
             return True
         if state in ("idle", "goal-stalled-candidate") and watcher.pending:
             # The stop settled without a confirmable turn (a short turn can
@@ -982,32 +1332,80 @@ def next_wake(cfg: Config) -> float:
     return max(1.0, min(cfg.interval, min(due_in)))
 
 
+def classify_file(path: str) -> int:
+    """Print how the current rules read a saved screen: the rule-tuning loop."""
+    with open(path) as handle:
+        tail = handle.read()
+    agent = detect_agent(tail, PROFILES)
+    if not agent:
+        print("agent: (none detected)")
+        return 1
+    state, marker = classify(tail, PROFILES[agent])
+    print(f"agent: {agent}\nstate: {state}\nmarker: {marker or '-'}\n"
+          f"composer: {composer_content(tail, PROFILES[agent])!r}")
+    return 0
+
+
 def main() -> int:
+    global WITNESS_FILE, DRY_RUN
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--surface", action="append", default=[], help="cmux surface id or ref; repeatable")
-    parser.add_argument("--all-codex", action="store_true", help="also discover every Codex session cmux knows about")
+    parser.add_argument("--all", action="store_true", help="discover every agent session cmux knows about (all enabled agents)")
+    parser.add_argument("--all-codex", action="store_true", help=argparse.SUPPRESS)  # pre-Claude spelling of --all
     parser.add_argument("--interval", type=float, default=60.0, help="seconds between steady-state polls (default 60; sends are time-gated, so faster polls never mean faster sends; a detected stop is worked at full speed inline)")
     parser.add_argument("--dry-run", action="store_true", help="classify and log, never send")
     parser.add_argument("--log", default="", help="append actions to this file")
     parser.add_argument("--stats", default=os.path.expanduser("~/.local/state/cmux-capacity-watchdog.jsonl"),
                         help="append structured stats events to this JSONL file")
+    parser.add_argument("--witness-file", default=WITNESS_FILE,
+                        help="witnessed-busy state (default: %(default)s); give a trial run its own")
+    parser.add_argument("--rules", default=RULES_FILE, help="rules override file (default: %(default)s)")
     parser.add_argument("--report", action="store_true", help="print aggregate stats and exit")
+    parser.add_argument("--check-rules", action="store_true", help="validate the rules file, print the effective rules, and exit")
+    parser.add_argument("--classify", metavar="SCREEN_FILE", help="print how the rules read a saved screen (cmux read-screen output) and exit")
     args = parser.parse_args()
     if args.report:
         return report(args.stats)
-    if not args.surface and not args.all_codex:
-        parser.error("give at least one --surface or pass --all-codex")
+    loader = RulesLoader(args.rules)
+    PROFILES.update(loader.load(lambda message: print(message, file=sys.stderr)))
+    if args.check_rules:
+        if loader.error:
+            return 1
+        print(json.dumps({name: profile.rules for name, profile in PROFILES.items()}, indent=2, ensure_ascii=False))
+        return 0
+    if args.classify:
+        return classify_file(args.classify)
+    discover = args.all or args.all_codex
+    if not args.surface and not discover:
+        parser.error("give at least one --surface or pass --all")
 
+    WITNESS_FILE = args.witness_file
+    DRY_RUN = args.dry_run
     cfg = Config(interval=args.interval, dry_run=args.dry_run, log_file=args.log, stats_file=args.stats)
     witnesses = load_witnesses(lambda message: log(cfg, message))
     for surface in args.surface:
-        cfg.watchers[surface] = Watcher(surface=surface, last_seen_busy=witnesses.get(surface, 0.0))
-    log(cfg, f"watchdog v{WATCHDOG_VERSION} starting: poll {cfg.interval}s, fast ladder x{MAX_ACTIONS_PER_STOP} "
-             f"(backoff 5s->{FAST_BACKOFF_CAP}s, grace {CONFIRM_GRACE}s), slow lane {SLOW_LANE_INTERVAL}s, "
-             f"witness freshness {WITNESS_FRESHNESS // 3600}h, dry_run={cfg.dry_run}, all_codex={args.all_codex}")
-    record(cfg, "watchdog_started", interval_s=cfg.interval, fast_attempts=MAX_ACTIONS_PER_STOP,
-           slow_lane_s=SLOW_LANE_INTERVAL, witness_freshness_h=WITNESS_FRESHNESS // 3600,
-           dry_run=cfg.dry_run, all_codex=args.all_codex, pinned=list(cfg.watchers))
+        for cli in running_clis():
+            try:
+                cmux("read-screen", "--surface", surface, "--lines", "1", cli=cli)
+                SURFACE_CLI[surface] = cli
+                break
+            except Exception:
+                continue
+        try:
+            agent = detect_agent(read_tail(surface, DISCOVERY_LINES), PROFILES) or "codex"
+        except Exception:
+            agent = "codex"
+        cfg.watchers[surface] = Watcher(surface=surface, agent=agent, last_seen_busy=witnesses.get(surface, 0.0))
+    ladders = ", ".join(f"{name}: x{p.fast_attempts} fast then every {p.slow_lane_interval}s"
+                        + ("" if p.enabled else " (disabled)") for name, p in PROFILES.items())
+    log(cfg, f"watchdog v{WATCHDOG_VERSION} starting: poll {cfg.interval}s, {ladders}; "
+             f"backoff 5s->{FAST_BACKOFF_CAP}s, grace {CONFIRM_GRACE}s, "
+             f"witness freshness {WITNESS_FRESHNESS // 3600}h, cmux {', '.join(running_clis())}, rules {args.rules}, "
+             f"dry_run={cfg.dry_run}, discover={discover}")
+    record(cfg, "watchdog_started", interval_s=cfg.interval,
+           ladders={name: [p.fast_attempts, p.slow_lane_interval, p.enabled] for name, p in PROFILES.items()},
+           witness_freshness_h=WITNESS_FRESHNESS // 3600, cmux=running_clis(),
+           dry_run=cfg.dry_run, discover=discover, pinned=list(cfg.watchers))
 
     last_discovery = 0.0
     witnesses_dirty = False
@@ -1016,10 +1414,14 @@ def main() -> int:
     while True:
         scan_started = time.time()
         cfg.ignore_rules = load_ignore_rules()
-        if args.all_codex and time.time() - last_discovery >= DISCOVERY_INTERVAL:
-            discover_codex_surfaces(cfg, witnesses)
+        # Rule edits apply on the next cycle; watchers read PROFILES live.
+        PROFILES.update(loader.load(lambda message: log(cfg, message)))
+        if discover and time.time() - last_discovery >= DISCOVERY_INTERVAL:
+            discover_surfaces(cfg, witnesses)
             last_discovery = time.time()
         for watcher in list(cfg.watchers.values()):
+            if not watcher.profile.enabled:
+                continue
             witnesses_dirty = poll_surface(cfg, watcher, pinned) or witnesses_dirty
         if witnesses_dirty and time.time() - last_witness_save >= 60:
             save_witnesses(cfg.watchers)

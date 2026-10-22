@@ -1,0 +1,12 @@
+  for it, make sure that it uses this new version and then deploy it across the fleet when you     
+  know it works. Make sure all the existing rules continue to work.                                
+  ctrl+enter to send now
+
+· Elucidating… (1m 34s · ↓ 5.9k tokens)
+  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's current work
+                                                           ✔ Update installed · Restart to update
+───────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Press up to edit queued messages
+───────────────────────────────────────────────────────────────────────────────────────────────────
+  sr: account [max] · 5h 94% left · wk 93% left
+  ⏵⏵ auto mode on (shift+tab to cycle)
