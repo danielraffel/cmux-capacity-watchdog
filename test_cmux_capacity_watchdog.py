@@ -519,6 +519,38 @@ class PromptAnswerTest(unittest.TestCase):
         rule, reason = self.pooled_verdict(transcript)
         self.assertIsNotNone(rule, reason)
 
+    def workflow_verdict(self, script_path_for, session_id="sess-1"):
+        # Seen on m5s: Claude editing its own session's workflow script, a
+        # file under its config folder, so it asks; Yes / No only.
+        root, project = self.make_root()
+        screen = fixture("claude-pooled-memory-prompt-no-path.txt").replace("pooled-note.md", "wf_f6312ff9-118.js")
+        prompt = watchdog.find_pending_prompt(screen)
+        self.assertEqual(prompt[1], "wf_f6312ff9-118.js")
+        target = script_path_for(project)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        profile = watchdog.build_profiles({"claude": {"memory_roots_add": [root]}})["claude"]
+        return watchdog.prompt_rule_for(profile, prompt, "/tmp/repo", pending=lambda name: [target],
+                                        session_id=session_id)
+
+    def test_the_asking_sessions_own_workflow_script_is_answered(self):
+        rule, reason = self.workflow_verdict(
+            lambda project: os.path.join(project, "sess-1", "workflows", "scripts", "wf_f6312ff9-118.js"))
+        self.assertIsNotNone(rule, reason)
+
+    def test_another_sessions_or_misplaced_script_is_refused(self):
+        for where in [lambda p: os.path.join(p, "sess-2", "workflows", "scripts", "wf_f6312ff9-118.js"),
+                      lambda p: os.path.join(p, "sess-1", "workflows", "wf_f6312ff9-118.js"),
+                      lambda p: os.path.join(p, "sess-1", "wf_f6312ff9-118.js"),
+                      lambda p: "/tmp/repo/sess-1/workflows/scripts/wf_f6312ff9-118.js"]:
+            rule, reason = self.workflow_verdict(where)
+            self.assertIsNone(rule)
+            self.assertEqual(reason, "file is not a Claude memory note")
+
+    def test_a_workflow_script_needs_the_session_id(self):
+        rule, _ = self.workflow_verdict(
+            lambda p: os.path.join(p, "sess-1", "workflows", "scripts", "wf_f6312ff9-118.js"), session_id="")
+        self.assertIsNone(rule)
+
     def test_a_pending_repository_file_with_that_name_is_refused(self):
         root, project = self.make_root()
         transcript = self.transcript(project, [("t1", "/tmp/repo/pooled-note.md", False)])

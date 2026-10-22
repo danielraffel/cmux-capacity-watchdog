@@ -156,6 +156,10 @@ only by you, since they can quote what's on screen.
   the permission request cmux's Claude hook logged in its Feed
   (`~/.cmuxterm/workstream.jsonl`, matched by session ID, last 2 hours). If
   two pending writes share the name, the prompt is left for you.
+- The same file prompts are answered for the asking session's own workflow
+  scripts, `<root>/projects/<project>/<session-id>/workflows/scripts/<name>.js`,
+  when the session ID in that path is the asking session's. Another
+  session's script, or a `.js` anywhere else, is left for you.
 - Text the model writes (a file preview, a command's description) is never
   used as evidence.
 - Shell-command prompts ("Do you want to proceed?") are answered in only one

@@ -71,7 +71,7 @@ INSTANCE_LOCK = None  # held for the process lifetime
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-10-22.9"
+WATCHDOG_VERSION = "2026-10-22.10"
 
 # Per-agent rules: how to recognise the agent's screen, when it is busy, what
 # its composer looks like, which on-screen errors are resume evidence, and
@@ -1621,6 +1621,27 @@ def is_claude_memory_note(path: str, roots: list) -> bool:
     return False
 
 
+def is_session_workflow_script(path: str, roots: list, session_id: str) -> bool:
+    """`path` is absolute and names
+    <root>/projects/<project>/<session_id>/workflows/scripts/<n>.js for one
+    of the memory roots, with symlinks resolved: a workflow script Claude
+    wrote for the very session that is asking. Another session's script
+    never matches."""
+    if not session_id or not path.startswith("/") or not path.endswith(".js"):
+        return False
+    resolved = os.path.realpath(os.path.normpath(path))
+    folder, name = os.path.dirname(resolved), os.path.basename(resolved)
+    if not name.endswith(".js"):
+        return False
+    for root in roots:
+        projects = os.path.join(root, "projects") + "/"
+        if folder.startswith(projects):
+            rest = folder[len(projects):].split("/")
+            if len(rest) == 4 and rest[0] and rest[1] == session_id and rest[2:] == ["workflows", "scripts"]:
+                return True
+    return False
+
+
 FILE_PROMPT_TITLES = ("Create file", "Edit file", "Overwrite file")
 ALWAYS_ALLOW_OPTION = re.compile(
     r"\A2\. Yes, and always allow access to (.+?) (?:from this project|for this session)(?: \(shift\+tab\))?\Z")
@@ -1761,14 +1782,19 @@ def _squash(text: str) -> str:
     return "".join(text.split())
 
 
-def prompt_rule_for(profile: Profile, prompt, cwd: str, pending=None, pending_any=None, pending_bash=None):
+def prompt_rule_for(profile: Profile, prompt, cwd: str, pending=None, pending_any=None, pending_bash=None,
+                    session_id: str = ""):
     """(rule, reason): the first rule that answers the prompt, or None and
     the reason none did, for the record. Every rule must say which files it
-    covers; only "claude-memory" exists. `pending(file)` returns the target
+    covers; only "claude-memory" exists: Claude's memory notes, and the
+    asking session's own workflow scripts. `pending(file)` returns the target
     paths of the session's unanswered file tool calls for that name, used
     when the screen no longer shows the path."""
     question, file, header, options = prompt
     roots = _expand_roots(profile.rules.get("memory_roots", []))
+
+    def own_file(path: str) -> bool:
+        return is_claude_memory_note(path, roots) or is_session_workflow_script(path, roots, session_id)
     reason = "no rule matches the question"
     for rule in profile.rules.get("prompt_rules", []):
         pattern, answer = rule.get("question"), rule.get("answer")
@@ -1809,7 +1835,7 @@ def prompt_rule_for(profile: Profile, prompt, cwd: str, pending=None, pending_an
             if name not in FILE_TOOLS:
                 reason = f"the pending action is {name}, not a file edit"
                 continue
-            if target and is_claude_memory_note(target, roots):
+            if target and own_file(target):
                 return rule, ""
             reason = "file is not a Claude memory note"
             continue
@@ -1820,7 +1846,7 @@ def prompt_rule_for(profile: Profile, prompt, cwd: str, pending=None, pending_an
                 # Two unanswered writes with this name: can't tell which one
                 # is asking.
                 return None, "several pending writes share this file name"
-        if paths and all(is_claude_memory_note(path, roots) for path in paths):
+        if paths and all(own_file(path) for path in paths):
             return rule, ""
         reason = "file is not a Claude memory note" if paths else "could not resolve the file's path"
     return None, reason
@@ -2026,7 +2052,7 @@ def handle_prompt(cfg: Config, watcher: Watcher, tail: str, prompt) -> None:
                               if tool in FILE_TOOLS and path and os.path.basename(path) == name],
         pending_any=lambda: pending_tool_calls(transcript),
         # The Feed log holds the request even when the transcript doesn't.
-        pending_bash=lambda: calls)
+        pending_bash=lambda: calls, session_id=session_id)
     blocked = ""
     if not rule:
         blocked = reason
@@ -2034,7 +2060,7 @@ def handle_prompt(cfg: Config, watcher: Watcher, tail: str, prompt) -> None:
         blocked = "prompt answering is off for this agent"
     elif is_ignored(cfg.ignore_rules, watcher.surface, watcher.title):
         blocked = "session is excluded"
-    mentions_memory = file.endswith(".md") or "/memory/" in _unwrap(prompt[2][-30:] + list(prompt[3]))
+    mentions_memory = file.endswith((".md", ".js")) or "/memory/" in _unwrap(prompt[2][-30:] + list(prompt[3]))
     if not rule and fp not in watcher.near_misses and mentions_memory:
         # A prompt about a markdown file or a memory folder that no rule
         # answered: a real non-memory file, or a question or screen shape
