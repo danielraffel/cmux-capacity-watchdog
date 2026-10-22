@@ -151,6 +151,11 @@ only by you, since they can quote what's on screen.
   safe from its on-screen text.
 - Every answer is recorded, and so is every prompt left waiting more than 5
   minutes, with the reason it wasn't answered.
+- A **near miss** is a prompt whose question a rule answers but whose file
+  check refused (a real non-memory file, or a screen shape the parser
+  doesn't handle yet). It's recorded at once, and its screen is saved to
+  `~/.local/state/cmux-capacity-watchdog-misses/` (private, newest 50 kept)
+  so it can be turned into a test. `--problems` lists near misses.
 
 ## Advanced rules
 

@@ -71,7 +71,7 @@ INSTANCE_LOCK = None  # held for the process lifetime
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-10-22.2"
+WATCHDOG_VERSION = "2026-10-22.3"
 
 # Per-agent rules: how to recognise the agent's screen, when it is busy, what
 # its composer looks like, which on-screen errors are resume evidence, and
@@ -672,6 +672,7 @@ class Watcher:
     prompt_attempts: int = 0
     prompt_answers: dict = field(default_factory=dict)  # fingerprint -> answer times
     was_busy: bool = False  # last poll saw a running turn
+    near_misses: set = field(default_factory=set)  # prompt fingerprints already captured
     last_fingerprint: str = ""
     actions_on_stop: int = 0
     next_action_at: float = 0.0
@@ -1290,6 +1291,7 @@ def problems(stats_file: str, since_hours: float) -> int:
         "stale_stop_skipped": lambda e: f"stopped on {e.get('marker')!r} before the watchdog saw it working; resume it once by hand",
         "primed_stopped": lambda e: f"stopped on {e.get('marker')!r} before the watchdog saw it working; resume it once by hand",
     }
+    near_misses = [e for e in events if e.get("event") == "prompt_near_miss"]
     counts = {}
     open_issues = {}
     for e in events:
@@ -1307,7 +1309,11 @@ def problems(stats_file: str, since_hours: float) -> int:
             open_issues[surface] = e
     for surface, e in sorted(open_issues.items(), key=lambda kv: kv[1].get("ts", "")):
         issues.append(f"{describe[e['event']](e)} — {where(e)}")
+    for e in near_misses:
+        issues.append(f"near miss ({e.get('reason')}): {e.get('question')!r} at {e.get('ts')}; "
+                      f"screen {e.get('capture') or 'not saved'} — {where(e)}")
     print(f"{host}: {counts.get('resumed', 0)} resumed, {counts.get('prompt_answered', 0)} prompts answered, "
+          f"{len(near_misses)} near misses, "
           f"{counts.get('stop_detected', 0)} stops seen, {len(scans)} scans in the last {since_hours:g} h")
     for issue in issues:
         print(f"  ! {issue}")
@@ -1462,6 +1468,26 @@ PROMPT_WAITING_REPORT_SECONDS = 300.0
 # The same prompt coming back after each answer (a write that keeps failing)
 # is left for a person after this many answers in an hour.
 PROMPT_MAX_ANSWERS_PER_HOUR = 3
+# Screens of prompts a rule's question matched but its file check refused,
+# kept so a miss can be turned into a test. Private; newest 50 kept.
+NEAR_MISS_DIR = os.path.expanduser("~/.local/state/cmux-capacity-watchdog-misses")
+NEAR_MISS_KEEP = 50
+
+
+def save_near_miss(surface: str, tail: str) -> str:
+    """Write the prompt's screen to NEAR_MISS_DIR and prune old ones."""
+    try:
+        os.makedirs(NEAR_MISS_DIR, mode=0o700, exist_ok=True)
+        path = os.path.join(NEAR_MISS_DIR, f"{datetime.now().strftime('%Y%m%dT%H%M%S')}-{surface[:8]}.txt")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(tail)
+        saved = sorted(os.listdir(NEAR_MISS_DIR))
+        for old in saved[:-NEAR_MISS_KEEP]:
+            os.remove(os.path.join(NEAR_MISS_DIR, old))
+        return path
+    except OSError:
+        return ""
 
 
 def find_pending_prompt(tail: str):
@@ -1693,6 +1719,18 @@ def handle_prompt(cfg: Config, watcher: Watcher, tail: str, prompt) -> None:
         blocked = "prompt answering is off for this agent"
     elif is_ignored(cfg.ignore_rules, watcher.surface, watcher.title):
         blocked = "session is excluded"
+    if not rule and fp not in watcher.near_misses and any(
+            isinstance(r.get("question"), str) and re.search(r["question"], question)
+            for r in profile.rules.get("prompt_rules", [])):
+        # The question is one a rule answers, but its file check refused:
+        # either a real non-memory file or a screen shape we don't parse.
+        # Keep the screen so it can be checked and, if needed, fixed.
+        watcher.near_misses.add(fp)
+        capture = save_near_miss(watcher.surface, tail)
+        log(cfg, f"{watcher.surface}: near miss ({reason}): {question!r} screen={capture}")
+        record(cfg, "prompt_near_miss", surface=watcher.surface, title=watcher.title,
+               workspace=watcher.workspace, question=question[:200], file=file, reason=reason,
+               capture=capture)
     if blocked:
         if not watcher.prompt_reported and now - watcher.prompt_since >= PROMPT_WAITING_REPORT_SECONDS:
             watcher.prompt_reported = True

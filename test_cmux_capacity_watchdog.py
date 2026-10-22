@@ -453,6 +453,36 @@ class PromptAnswerTest(unittest.TestCase):
         roots = watchdog._expand_roots(["~/.claude"])
         self.assertFalse(all(watchdog.is_claude_memory_note(p, roots) for p in paths))
 
+    def test_a_refused_file_prompt_is_captured_once_as_a_near_miss(self):
+        import tempfile
+        screen = f"""────────────────
+ Create file
+ CLAUDE.md
+╌╌╌╌╌╌╌╌╌╌╌╌
+  1 notes
+╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to create CLAUDE.md?
+{self.FOOTER}"""
+        prompt = watchdog.find_pending_prompt(screen)
+        watcher = make_watcher("Q", agent="claude")
+        cfg = make_cfg()
+        cfg.watchers = {"Q": watcher}
+        events, sends = [], []
+        folder = tempfile.mkdtemp()
+        with mock.patch.object(watchdog, "NEAR_MISS_DIR", folder), \
+             mock.patch.object(watchdog, "session_cwd", lambda surface: "/tmp/repo"), \
+             mock.patch.object(watchdog, "cmux", lambda *a, **k: sends.append(a) or ""), \
+             mock.patch.object(watchdog, "record", lambda cfg, event, **f: events.append((event, f))):
+            watchdog.handle_prompt(cfg, watcher, screen, prompt)
+            watcher.prompt_since -= 6
+            watchdog.handle_prompt(cfg, watcher, screen, prompt)
+            watchdog.handle_prompt(cfg, watcher, screen, prompt)
+        near = [f for event, f in events if event == "prompt_near_miss"]
+        self.assertEqual(len(near), 1)
+        self.assertEqual(sends, [])
+        with open(near[0]["capture"]) as handle:
+            self.assertIn("Do you want to create CLAUDE.md?", handle.read())
+
     def test_a_rule_without_a_file_scope_never_answers(self):
         profile = watchdog.build_profiles({"claude": {"prompt_rules": [{"question": ".*", "answer": "1"}]}})["claude"]
         prompt = watchdog.find_pending_prompt(fixture("claude-memory-write-prompt.txt"))
