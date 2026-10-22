@@ -1,150 +1,166 @@
 # cmux-capacity-watchdog
 
-Keeps Codex and Claude Code sessions in cmux going when the provider has a
-bad moment. When a session stops on a transient error (Codex "Selected model
-is at capacity", a Subrouter `503 no non-exhausted claude accounts
-available`, a dropped stream), the watchdog types the resume command into
-that tab once the stop is confirmed, and keeps retrying gently until the
-session runs again.
+Keeps Claude Code and Codex sessions in [cmux](https://github.com/manaflow-ai/cmux)
+moving while you're away. It runs in the background on your Mac, reads your
+cmux tabs, and types for you in two situations:
 
-It runs on its own as a LaunchAgent, alongside Subrouter or without it. It
-reads tabs through the cmux CLI and needs nothing from Subrouter, so a
-Subrouter update can't break it. Nothing has to be launched by hand after a
-reboot.
-
-| Agent | Resumes on | Types |
+| Situation | What it types | Agents |
 |---|---|---|
-| Codex | goal paused with a capacity/overload/stream error on screen | `/goal resume` |
-| Codex | turn stopped with one of those errors, no goal | `continue` |
-| Claude Code | its last message is `API Error: 5xx`, overloaded, a dropped or stalled response, or a timeout | `continue` |
+| A turn stopped on a temporary provider error (model at capacity, overloaded, `API Error: 5xx`, a dropped or stalled response) | `continue`, or `/goal resume` for a Codex goal | Claude, Codex |
+| Claude asks permission to save one of its own memory notes ("Do you want to create MEMORY.md?") | `1` (Yes) | Claude |
 
-## Install (each Mac, once)
+Everything else (other permission prompts, a deliberate pause, a finished
+turn, an unsent draft) is left for you. It works with or without
+[Subrouter](https://github.com/manaflow-ai/subrouter) and needs nothing from it.
+
+## Install
 
 ```sh
-git clone git@github.com:danielraffel/cmux-capacity-watchdog.git
+git clone https://github.com/danielraffel/cmux-capacity-watchdog.git
 cd cmux-capacity-watchdog
 ./install.sh
 ```
 
-`install.sh` copies the script to `~/bin/`, writes the LaunchAgent
-(`com.danielraffel.cmux-capacity-watchdog`, starts at login, restarted if it
-exits) and starts it. To update: `git pull && ./install.sh`. Also:
-`./install.sh --status` and `./install.sh --uninstall`.
+That's all. It installs a LaunchAgent that starts at login and restarts if it
+exits; nothing runs in a terminal. To update later: `git pull && ./install.sh`.
+`./install.sh --status` shows whether it's running; `./install.sh --uninstall`
+removes it.
 
-It watches every Codex and Claude tab in every running cmux app (release and
-nightly side by side), and picks up new tabs within 5 minutes.
+It watches every Claude and Codex tab in every running cmux app (release and
+nightly). If a cmux app only accepts automation from processes it started
+(its default), set **Settings → Automation → Socket control** to *Password* or
+*Allow all* so a background process can read its tabs.
 
-## When it acts, and when it never does
+## Settings
 
-Every resume needs evidence: a known transient-error signature from the
-current stop. A session that stopped any other way is never touched: user
-pause, Esc interrupt, a clean finish, a deliberately abandoned tab.
+Out of the box: **resume is on for Claude and Codex; answering prompts is off.**
 
-- **Busy turns** are never touched.
-- **A paused goal with no error visible** is a deliberate pause. It is left
-  alone (`deliberate_pause_skipped`).
-- **A draft in the composer** blocks action. One exception: a draft that
-  exactly matches the resume command is submitted with Enter, at most 3
-  times. It is either the watchdog's own send from before a restart or the
-  same thing the user meant to type.
-- **Witness rule.** A stop can only be resumed if the watchdog saw that
-  session working within the last 8 hours (persisted across restarts). A tab
-  found already stopped is logged as `stale_stop_skipped` and left alone. So
-  a session that dies while the watchdog is down stays stopped until you
-  resume it once by hand.
-- **Codex** evidence must be in the last 12 lines of the screen. An idle
-  "pursuing goal" footer with no error is logged (`stall_observed`) and never
-  acted on.
-- **Claude** evidence must be Claude's last message above the composer. An
-  old error followed by a normal reply, or by a newer prompt from you, does
-  not count. Claude's own `Retrying in Ns · attempt k/10` loop counts as
-  working, never as a resume: a `continue` is confirmed only by a real
-  running turn. Those retries count toward the witness rule only when your
-  own turn started them, so a long quota outage still ends at the 8-hour
-  window.
+Change that in one file, `~/.config/cmux-capacity-watchdog/rules.json`.
+Create it if it doesn't exist. It's re-read every minute, so a change applies
+without restarting anything.
 
-Exclusions: `~/.config/cmux-capacity-watchdog/ignore`, one surface UUID or
-`title:<substring>` per line. It is re-read every cycle and takes effect
-immediately.
+| Setting | Default | What it does |
+|---|---|---|
+| `enabled` | `true` | Watch this agent at all |
+| `resume` | `true` | Type `continue` / `/goal resume` after a temporary provider error |
+| `answer_prompts` | `false` | Answer the permission prompts its prompt rules cover (Claude memory notes) |
 
-## Retry timing
+Each setting is per agent: put it under `"claude"` or `"codex"`.
 
-Polls are cheap (every 60 seconds) and only detect. Sends are spaced by
-backoff, confirmation windows and evidence novelty, so polling faster never
-means sending faster. Recovery is round-robin: each visit makes at most one
-attempt per session, so a session storming through retries never delays the
-others.
+**Claude only** (leave Codex alone):
 
-| | Fast attempts | Spacing | Then |
-|---|---|---|---|
-| Codex | 12 | 5s doubling to 60s | every 5 minutes |
-| Claude | 3 | 5s doubling, plus Claude's own 10 retries in between | every 15 minutes |
+```json
+{ "agents": { "codex": { "enabled": false } } }
+```
 
-After an unconfirmed send, nothing else is sent for at least 45 seconds, so a
-turn that is slow to start never gets a duplicate. Every visit re-reads the
-screen first: typing, a state change, or the session resuming on its own
-means no attempt happens.
+**Codex only:**
 
-## Rules
+```json
+{ "agents": { "claude": { "enabled": false } } }
+```
 
-All per-agent behavior lives in `DEFAULT_PROFILES` in the script: how the
-screen is recognised, busy markers, composer shape, evidence, commands and
-retry timing. To change it on one Mac without editing code, create
-`~/.config/cmux-capacity-watchdog/rules.json`:
+**Resume both, and answer Claude's memory-note prompts:**
+
+```json
+{ "agents": { "claude": { "answer_prompts": true } } }
+```
+
+**Answer Claude's prompts but never type `continue` for it:**
+
+```json
+{ "agents": { "claude": { "resume": false, "answer_prompts": true } } }
+```
+
+Check what's in force with
+`python3 ~/bin/cmux-capacity-watchdog.py --check-rules`. A file with a mistake
+is ignored (the previous good settings stay) and the log says why.
+
+To leave one tab alone, add its surface ID, or `title:<part of the tab title>`,
+to `~/.config/cmux-capacity-watchdog/ignore`, one per line.
+
+## Is it working?
+
+```sh
+python3 ~/bin/cmux-capacity-watchdog.py --problems      # this Mac, last 6 hours
+./fleet-report.sh 24                                    # several Macs, last 24 hours
+```
+
+`--problems` prints what was resumed and answered, then names every session
+that needs you: a prompt nobody answered, a resume that keeps failing, a
+session that was already stopped when the watchdog started. Each line gives
+the agent, workspace, tab title and surface ID. For `fleet-report.sh`, list
+your Macs' ssh names in `~/.config/cmux-capacity-watchdog/fleet`, one per line
+(`local` is this Mac).
+
+Logs are in `~/.local/state/`:
+
+- `cmux-capacity-watchdog.log` is readable;
+- `cmux-capacity-watchdog.jsonl` holds one JSON event per action;
+- `--report` totals the JSON events.
+
+Each log rolls over at 20 MB and keeps one previous file.
+
+## How it decides
+
+**Resume.**
+
+- It acts only when the error is on screen *and* it saw that session working
+  in the last 8 hours. A tab that was already stopped when it first saw it is
+  left alone, so abandoned tabs stay abandoned. Resume such a tab once by hand
+  and it's covered from then on.
+- For Claude, the error must be Claude's last message: an old error followed
+  by a normal reply doesn't count.
+- It never types over a draft and never interrupts a running turn.
+- Retries back off:
+  - Codex: 12 quick attempts, then every 5 minutes.
+  - Claude: 3 quick attempts (Claude already retries 10 times itself), then
+    every 15 minutes.
+
+**Prompts.**
+
+- It answers only a prompt that has sat unchanged for 5 seconds, at most
+  twice. If it's still showing, it's left for you and reported.
+- A memory-note prompt is answered only when the file resolves to
+  `<root>/projects/<project>/memory/<name>.md` under one of your Claude
+  folders (`~/.claude`, or Subrouter's `~/.subrouter/codex/claude-proxy/*`).
+  A file named `MEMORY.md` anywhere else, or a project's own `.claude`
+  folder, never qualifies.
+- Every prompt is recorded, answered or not.
+
+## Advanced rules
+
+All behavior lives in `DEFAULT_PROFILES` near the top of
+`cmux-capacity-watchdog.py`: which errors count, retry timing, the prompt
+rules, the memory folders. Any of it can be overridden in `rules.json`. A key
+replaces the default, and a `<key>_add` key appends to a list:
 
 ```json
 {
   "agents": {
-    "claude": {"evidence_regex_add": ["^[⏺●] API Error: 429\\b"]},
-    "codex":  {"slow_lane_interval": 600}
+    "codex":  { "slow_lane_interval": 600 },
+    "claude": { "evidence_regex_add": ["^[⏺●] API Error: 429\\b"],
+                "memory_roots_add": ["~/work/claude-config"] }
   }
 }
 ```
 
-- A key replaces the default. A `<key>_add` key appends to a list.
-- `"enabled": false` turns an agent off.
-- The file is re-read every cycle. No restart of the watchdog or of any
-  session is needed.
-- A malformed edit keeps the last good rules and says so in the log.
-- `python3 ~/bin/cmux-capacity-watchdog.py --check-rules` validates the file
-  and prints the effective rules.
+Grow these from what actually happened (the JSON log records the on-screen
+text of every stop), not speculatively. To try a rule against a real screen:
 
-Grow evidence from what stats actually captured, never speculatively. To try
-a rule against a real screen, save it with
-`cmux read-screen --surface <id> --lines 80 > screen.txt` and run
-`python3 cmux-capacity-watchdog.py --classify screen.txt`. Rules that prove
-out belong in `DEFAULT_PROFILES` plus a fixture in `fixtures/`, so every Mac
-gets them on the next `git pull && ./install.sh`.
+```sh
+cmux read-screen --surface <id> --lines 80 > screen.txt
+python3 cmux-capacity-watchdog.py --classify screen.txt
+```
 
-## Stats
-
-Every stop and action lands in `~/.local/state/cmux-capacity-watchdog.jsonl`,
-tagged with host, agent and behavior version (`WATCHDOG_VERSION`, bumped on
-every behavior change). `python3 ~/bin/cmux-capacity-watchdog.py --report`
-aggregates them, segmented by version:
-
-- stops by type and matched marker, with an example excerpt
-- resume success, attempts and latency
-- the flap rate (a new stop within 5 minutes of a resume)
-- lane split and the worst-offending sessions
-
-The human-readable log is `~/.local/state/cmux-capacity-watchdog.log`.
-
-## Tests
+## Development
 
 ```sh
 python3 test_cmux_capacity_watchdog.py
 ```
 
-The unit tests cover the scheduling guarantees, the rules file, and Claude
-screen handling. `fixtures/` holds real Claude Code screens captured against
-`e2e/anthropic_stub.py`, a local stand-in for the Messages API that can
-return Subrouter's exact 503 or a slow success. Run a throwaway Claude against
-it (`ANTHROPIC_BASE_URL=http://127.0.0.1:31499`) to capture new screens or
-rehearse a resume end to end, with no tokens spent.
-
-## Known issues
-
-Tracked in GitHub issues, notably
-[#1](https://github.com/danielraffel/cmux-capacity-watchdog/issues/1)
-(deliberately stopped sessions and auto-resume).
+`fixtures/` holds real Claude Code screens captured against
+`e2e/anthropic_stub.py`, a local stand-in for the Anthropic API that can
+return Subrouter's "no non-exhausted accounts" 503, a slow success, or a
+`Write` tool call. Point a throwaway Claude at it
+(`ANTHROPIC_BASE_URL=http://127.0.0.1:31499`, its own `CLAUDE_CONFIG_DIR`) to
+rehearse a resume or a prompt end to end without spending tokens.

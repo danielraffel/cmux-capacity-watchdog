@@ -69,7 +69,7 @@ DRY_RUN = False
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-10-21.2"
+WATCHDOG_VERSION = "2026-10-21.3"
 
 # Per-agent rules: how to recognise the agent's screen, when it is busy, what
 # its composer looks like, which on-screen errors are resume evidence, and
@@ -1160,21 +1160,76 @@ def discover_app(cfg: Config, witnesses: dict, cli: str) -> None:
         log(cfg, f"discovery: now watching {agent} session {sid} ({title} in {workspace})")
 
 
+def load_events(stats_file: str) -> list:
+    """Every stats event, oldest first, including the rotated-out file."""
+    events = []
+    for path in (stats_file + ".1", stats_file):
+        try:
+            with open(path) as handle:
+                for line in handle:
+                    line = line.strip()
+                    if line:
+                        try:
+                            events.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+        except OSError:
+            continue
+    return events
+
+
+def problems(stats_file: str, since_hours: float) -> int:
+    """A short health report for one host: whether the watchdog is
+    scanning, what it did, and every session that needs a person, named by
+    agent, workspace, tab and surface. Exit status 1 when anything needs
+    attention, so a fleet script can flag the host."""
+    cutoff = datetime.fromtimestamp(time.time() - since_hours * 3600).isoformat(timespec="seconds")
+    events = [e for e in load_events(stats_file) if e.get("ts", "") >= cutoff]
+    host = socket.gethostname().split(".")[0]
+    scans = [e for e in events if e.get("event") == "scan_completed"]
+    issues = []
+    if not scans:
+        issues.append("watchdog has not completed a scan in this window")
+    else:
+        age = time.time() - datetime.fromisoformat(scans[-1]["ts"]).timestamp()
+        if age > 600:
+            issues.append(f"last scan {int(age // 60)} min ago; the watchdog may be stuck")
+    def where(e):
+        return (f"{e.get('agent', '?')} \"{e.get('title') or '-'}\" in \"{e.get('workspace') or '-'}\" "
+                f"[{(e.get('surface') or '')[:8]}]")
+    counts = {}
+    for e in events:
+        counts[e.get("event")] = counts.get(e.get("event"), 0) + 1
+    latest = {}
+    for e in events:
+        if e.get("surface"):
+            latest[(e["surface"], e.get("event"))] = e
+    # Sessions currently waiting on something the watchdog will not do.
+    for (surface, event), e in sorted(latest.items(), key=lambda kv: kv[1].get("ts", "")):
+        later = [x for x in events if x.get("surface") == surface and x.get("ts", "") > e.get("ts", "")
+                 and x.get("event") in ("resumed", "witnessed_busy", "prompt_answered")]
+        if later:
+            continue
+        if event == "prompt_waiting":
+            issues.append(f"prompt waiting on a person ({e.get('reason')}): {e.get('question')!r} — {where(e)}")
+        elif event == "prompt_answer_failed":
+            issues.append(f"prompt still showing after two answers: {e.get('question')!r} — {where(e)}")
+        elif event == "slow_lane":
+            issues.append(f"resume keeps failing (slow lane) — {where(e)}")
+        elif event in ("stale_stop_skipped", "primed_stopped") and (e.get("marker") or "") not in ("goal stalled", "goal paused", ""):
+            issues.append(f"stopped on {e.get('marker')!r} before the watchdog saw it working; resume it once by hand — {where(e)}")
+    print(f"{host}: {counts.get('resumed', 0)} resumed, {counts.get('prompt_answered', 0)} prompts answered, "
+          f"{counts.get('stop_detected', 0)} stops seen, {len(scans)} scans in the last {since_hours:g} h")
+    for issue in issues:
+        print(f"  ! {issue}")
+    if not issues:
+        print("  ok")
+    return 1 if issues else 0
+
+
 def report(stats_file: str) -> int:
     """Aggregate the JSONL stats into the numbers that matter for tuning."""
-    events = []
-    try:
-        with open(stats_file) as handle:
-            for line in handle:
-                line = line.strip()
-                if line:
-                    try:
-                        events.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
-    except OSError as exc:
-        print(f"no stats yet ({exc})")
-        return 1
+    events = load_events(stats_file)
     if not events:
         print("no stats yet")
         return 1
@@ -1700,11 +1755,15 @@ def main() -> int:
                         help="witnessed-busy state (default: %(default)s); give a trial run its own")
     parser.add_argument("--rules", default=RULES_FILE, help="rules override file (default: %(default)s)")
     parser.add_argument("--report", action="store_true", help="print aggregate stats and exit")
+    parser.add_argument("--problems", nargs="?", type=float, const=6.0, metavar="HOURS",
+                        help="print this host's health and anything needing a person over the last HOURS (default 6), and exit")
     parser.add_argument("--check-rules", action="store_true", help="validate the rules file, print the effective rules, and exit")
     parser.add_argument("--classify", metavar="SCREEN_FILE", help="print how the rules read a saved screen (cmux read-screen output) and exit")
     args = parser.parse_args()
     if args.report:
         return report(args.stats)
+    if args.problems is not None:
+        return problems(args.stats, args.problems)
     loader = RulesLoader(args.rules)
     PROFILES.update(loader.load(lambda message: print(message, file=sys.stderr)))
     if args.check_rules:
