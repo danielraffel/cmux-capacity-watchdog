@@ -470,7 +470,7 @@ class PromptAnswerTest(unittest.TestCase):
         events, sends = [], []
         folder = tempfile.mkdtemp()
         with mock.patch.object(watchdog, "NEAR_MISS_DIR", folder), \
-             mock.patch.object(watchdog, "session_info", lambda surface: ("/tmp/repo", "")), \
+             mock.patch.object(watchdog, "session_info", lambda surface: ("/tmp/repo", "", "")), \
              mock.patch.object(watchdog, "cmux", lambda *a, **k: sends.append(a) or ""), \
              mock.patch.object(watchdog, "record", lambda cfg, event, **f: events.append((event, f))):
             watchdog.handle_prompt(cfg, watcher, screen, prompt)
@@ -550,6 +550,65 @@ class PromptAnswerTest(unittest.TestCase):
         rule, reason = self.pooled_verdict(transcript)
         self.assertIsNone(rule)
         self.assertEqual(reason, "could not resolve the file's path")
+
+    def feed(self, rows):
+        import base64, tempfile
+        path = os.path.join(tempfile.mkdtemp(), "workstream.jsonl")
+        with open(path, "w") as handle:
+            for session, request_id, tool, target, status, created in rows:
+                key = base64.b64encode(session.encode()).decode()
+                handle.write(json.dumps({
+                    "id": request_id, "kind": "permissionRequest", "createdAt": created,
+                    "workstreamId": "cmux-feed-v1:Y2xhdWRl:" + key, "status": status,
+                    "payload": {"permissionRequest": {"requestId": request_id, "toolName": tool,
+                                "toolInputJSON": json.dumps({"file_path": target, "content": "x"})}}}) + "\n")
+        return path
+
+    def feed_verdict(self, rows, session="5422ae0b-26bf-489c-ada4-6103181eaa26"):
+        root, project = self.make_root()
+        transcript = self.transcript(project, [])
+        rows = [tuple(project if part == "PROJECT" else part for part in row) for row in rows]
+        rows = [row[:3] + (row[3].replace("PROJECT", project),) + row[4:] for row in rows]
+        with mock.patch.object(watchdog, "FEED_FILE", self.feed(rows)):
+            calls = watchdog.session_pending_calls(transcript, session)
+        prompt = watchdog.find_pending_prompt(fixture("claude-pooled-memory-prompt-no-path.txt"))
+        profile = watchdog.build_profiles({"claude": {"memory_roots_add": [root]}})["claude"]
+        return watchdog.prompt_rule_for(
+            profile, prompt, "/tmp/repo",
+            pending=lambda name: [p for t, p, _c in calls if t in watchdog.FILE_TOOLS
+                                  and os.path.basename(p) == name])
+
+    NOW = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    SID = "5422ae0b-26bf-489c-ada4-6103181eaa26"
+
+    def test_a_write_missing_from_the_transcript_is_found_in_the_feed(self):
+        # Seen on m3: the Write never reached any transcript, but cmux's hook
+        # logged it, then marked it expired while Claude's dialog stayed up.
+        note = "PROJECT/memory/pooled-note.md"
+        rule, reason = self.feed_verdict([
+            (self.SID, "R1", "Write", note, {"pending": {}}, self.NOW),
+            (self.SID, "R1", "Write", note, {"expired": {"at": self.NOW}}, self.NOW),
+        ])
+        self.assertIsNotNone(rule, reason)
+
+    def test_another_sessions_feed_request_is_not_evidence(self):
+        rule, reason = self.feed_verdict([
+            ("other-session", "R1", "Write", "PROJECT/memory/pooled-note.md", {"pending": {}}, self.NOW)])
+        self.assertIsNone(rule)
+        self.assertEqual(reason, "could not resolve the file's path")
+
+    def test_a_decided_or_old_feed_request_is_not_evidence(self):
+        rule, reason = self.feed_verdict([
+            (self.SID, "R1", "Write", "PROJECT/memory/pooled-note.md", {"approved": {}}, self.NOW),
+            (self.SID, "R2", "Write", "PROJECT/memory/pooled-note.md", {"pending": {}}, "2020-01-01T00:00:00Z"),
+        ])
+        self.assertIsNone(rule)
+
+    def test_a_feed_request_for_a_repository_file_is_refused(self):
+        rule, reason = self.feed_verdict([
+            (self.SID, "R1", "Write", "/tmp/repo/pooled-note.md", {"pending": {}}, self.NOW)])
+        self.assertIsNone(rule)
+        self.assertEqual(reason, "file is not a Claude memory note")
 
     PROCEED = """ │ Claude requested permissions to edit ~/.claude/projects/p/memory/MEMORY.md which is a sensitive file.
  Do you want to proceed?
@@ -690,7 +749,7 @@ class PromptAnswerTest(unittest.TestCase):
         cfg.watchers = {"P": watcher}
         tail = fixture("claude-memory-write-prompt.txt")
         with mock.patch.dict(watchdog.PROFILES, {"claude": profile}), \
-             mock.patch.object(watchdog, "session_info", lambda surface: (self.CWD, "")), \
+             mock.patch.object(watchdog, "session_info", lambda surface: (self.CWD, "", "")), \
              mock.patch.object(watchdog, "cmux", lambda *args, **kw: sends.append(args) or ""), \
              mock.patch.object(watchdog, "read_tail", side_effect=[tail, "answered\n"]), \
              mock.patch.object(watchdog.time, "sleep", lambda s: None), \

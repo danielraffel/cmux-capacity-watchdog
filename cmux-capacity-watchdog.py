@@ -1854,6 +1854,63 @@ def pending_tool_calls(transcript: str) -> list:
     return found
 
 
+FEED_FILE = os.path.expanduser("~/.cmuxterm/workstream.jsonl")
+FEED_TAIL_BYTES = 8 * 1024 * 1024
+FEED_WINDOW_SECONDS = 2 * 3600
+
+
+def feed_permission_requests(session_id: str) -> list:
+    """(tool name, file_path or "", command or "") of the session's recent
+    permission requests, as cmux's Claude hook recorded them in the Feed log
+    when Claude asked. Claude doesn't always write a call to its transcript
+    before asking; the hook always sees it. The Feed marks a request
+    "expired" once its own wait ends, while Claude's dialog stays up, so both
+    pending and expired requests count; any other status means it was
+    decided."""
+    if not session_id:
+        return []
+    import base64
+    key = base64.b64encode(session_id.encode()).decode().rstrip("=")
+    try:
+        with open(FEED_FILE, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - FEED_TAIL_BYTES))
+            data = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    cutoff = datetime.utcfromtimestamp(time.time() - FEED_WINDOW_SECONDS).strftime("%Y-%m-%dT%H:%M:%S")
+    found = {}
+    for line in data.splitlines():
+        if key not in line or '"permissionRequest"' not in line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or not str(row.get("workstreamId", "")).rstrip("=").endswith(key):
+            continue
+        if str(row.get("createdAt", "")) < cutoff:
+            continue
+        request = (row.get("payload") or {}).get("permissionRequest") if isinstance(row.get("payload"), dict) else None
+        if not isinstance(request, dict):
+            continue
+        try:
+            tool_input = json.loads(request.get("toolInputJSON") or "{}")
+        except ValueError:
+            continue
+        if not isinstance(tool_input, dict):
+            continue
+        status = row.get("status")
+        open_request = isinstance(status, dict) and set(status) <= {"pending", "expired"}
+        target, command = tool_input.get("file_path"), tool_input.get("command")
+        found[str(row.get("id") or request.get("requestId"))] = open_request and (
+            str(request.get("toolName")),
+            os.path.expanduser(target) if isinstance(target, str) else "",
+            command if isinstance(command, str) else "")
+    return [call for call in found.values() if call]
+
+
 def pending_write_paths(transcript: str, file: str) -> list:
     """Targets of the session's unanswered file tool calls for `file`."""
     if not file:
@@ -1871,7 +1928,7 @@ def session_info(surface: str) -> tuple:
     cached = _SESSION_INFO.get(surface)
     if cached and time.time() - cached[1] < 60:
         return cached[0]
-    info = ("", "")
+    info = ("", "", "")
     try:
         data = json.loads(cmux("sessions", "list", "--json", "--surface", surface,
                                cli=SURFACE_CLI.get(surface, "")))
@@ -1884,17 +1941,30 @@ def session_info(surface: str) -> tuple:
             # in, which can differ from where its shell later moved.
             cwd = session.get("launch_working_directory") or session.get("cwd") or ""
             transcript = session.get("transcript_path") or ""
-            info = (cwd if isinstance(cwd, str) else "", transcript if isinstance(transcript, str) else "")
+            session_id = session.get("session_id") or ""
+            info = (cwd if isinstance(cwd, str) else "", transcript if isinstance(transcript, str) else "",
+                    session_id if isinstance(session_id, str) else "")
             if info[0] or info[1]:
                 break
     except Exception:
-        info = ("", "")
+        info = ("", "", "")
     _SESSION_INFO[surface] = (info, time.time())
     return info
 
 
 def session_cwd(surface: str) -> str:
     return session_info(surface)[0]
+
+
+def session_pending_calls(transcript: str, session_id: str) -> list:
+    """Unanswered calls from the transcripts plus the session's recent
+    permission requests from the Feed, without duplicates."""
+    seen, calls = set(), []
+    for call in pending_tool_calls(transcript) + feed_permission_requests(session_id):
+        if call not in seen:
+            seen.add(call)
+            calls.append(call)
+    return calls
 
 
 def handle_prompt(cfg: Config, watcher: Watcher, tail: str, prompt) -> None:
@@ -1915,10 +1985,13 @@ def handle_prompt(cfg: Config, watcher: Watcher, tail: str, prompt) -> None:
     if now - watcher.prompt_since < PROMPT_QUIET_SECONDS:
         return
     profile = watcher.profile
-    cwd, transcript = session_info(watcher.surface)
-    rule, reason = prompt_rule_for(profile, prompt, cwd,
-                                   pending=lambda name: pending_write_paths(transcript, name),
-                                   pending_any=lambda: pending_tool_calls(transcript))
+    cwd, transcript, session_id = session_info(watcher.surface)
+    calls = session_pending_calls(transcript, session_id)
+    rule, reason = prompt_rule_for(
+        profile, prompt, cwd,
+        pending=lambda name: [path for tool, path, _cmd in calls
+                              if tool in FILE_TOOLS and path and os.path.basename(path) == name],
+        pending_any=lambda: pending_tool_calls(transcript))
     blocked = ""
     if not rule:
         blocked = reason

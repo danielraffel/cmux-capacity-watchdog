@@ -149,9 +149,10 @@ only by you, since they can quote what's on screen.
 - When the path has scrolled off and Claude lists no folder (Subrouter-pooled
   sessions offer only Yes / No), the evidence is the pending tool call
   itself. That's the `file_path` of the unanswered `Write` or `Edit` for
-  that file name, in the session's transcript or one of its subagents'.
-  Claude records it before asking. If two pending writes share the name,
-  the prompt is left for you.
+  that file name, from the session's transcript, one of its subagents', or
+  the permission request cmux's Claude hook logged in its Feed
+  (`~/.cmuxterm/workstream.jsonl`, matched by session ID, last 2 hours). If
+  two pending writes share the name, the prompt is left for you.
 - Text the model writes (a file preview, a command's description) is never
   used as evidence.
 - Shell-command prompts ("Do you want to proceed?") are answered in only one
