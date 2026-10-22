@@ -868,6 +868,16 @@ class RecommendedChoiceTest(unittest.TestCase):
         self.assertEqual(watchdog.choice_keys(watchdog.find_choice_dialog(changed)),
                          ((), "an answer other than the Recommended one was chosen"))
 
+    def test_a_review_screen_with_barred_questions_is_submitted(self):
+        # Seen on m3: each question line starts with "│ ●", and a long one
+        # wraps onto a second barred line.
+        screen = fixture("claude-ask-multi-submit.txt")
+        screen = screen.replace(" ● Which stub color", " │ ● Which stub color").replace(
+            " ● Which stub size should it use?",
+            " │ ● Which stub size should it use, given a long question that\n │   wraps onto a second line?")
+        choice = watchdog.find_choice_dialog(screen)
+        self.assertEqual(watchdog.choice_keys(choice), (("1",), ""))
+
     def test_no_or_several_recommended_options_are_left_for_a_person(self):
         screen = fixture("claude-ask-single-recommended.txt")
         none = watchdog.find_choice_dialog(screen.replace(" (Recommended)", ""))

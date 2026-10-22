@@ -71,7 +71,7 @@ INSTANCE_LOCK = None  # held for the process lifetime
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-10-22.10"
+WATCHDOG_VERSION = "2026-10-22.11"
 
 # Per-agent rules: how to recognise the agent's screen, when it is busy, what
 # its composer looks like, which on-screen errors are resume evidence, and
@@ -2162,7 +2162,8 @@ def find_choice_dialog(tail: str):
     filled = [i for i in range(tab + 1, end) if lines[i].strip()]
     if len(filled) >= 3 and [lines[i].strip().lstrip("❯ ") for i in filled[-3:]] == \
             ["Ready to submit your answers?", "1. Submit answers", "2. Cancel"] and "Submit" in tabs:
-        body = [line.strip() for line in lines[tab + 1:filled[-3]]]
+        # Claude may draw a bar before each question: "│ ● Question".
+        body = [line.strip().lstrip("│").strip() for line in lines[tab + 1:filled[-3]]]
         asked = [line for line in body if line.startswith("●")]
         answers = [line[1:].strip() for line in body if line.startswith("→")]
         return {"kind": "submit", "tabs": tabs, "question": "Ready to submit your answers?",
