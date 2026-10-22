@@ -114,12 +114,19 @@ DEFAULT_PROFILES = {
         "fast_attempts": 12,
         "slow_lane_interval": 300,
         "tail_lines": 30,
+        # Feature switches, each enabled on its own: typing the resume
+        # command after a transient stop, and answering permission prompts
+        # that a prompt rule covers.
+        "resume": True,
+        "answer_prompts": False,
+        "prompt_rules": [],
     },
     "claude": {
         "enabled": True,
         # Claude Code draws its composer as a "❯" line between two rules. Its
-        # selection dialogs also use "❯" but never inside the rules.
-        "detect_contains": [],
+        # selection dialogs also use "❯" but never inside the rules. A
+        # permission prompt hides the composer; its footer names Claude.
+        "detect_contains": ["tab to amend"],
         "detect_composer": True,
         "prompt_glyph": "❯",
         "composer_needs_border": True,
@@ -156,6 +163,22 @@ DEFAULT_PROFILES = {
         # Full-screen Claude can sit its last message far above the composer
         # in a tall window with a short transcript.
         "tail_lines": 80,
+        "resume": True,
+        # Off unless the rules file turns it on.
+        "answer_prompts": False,
+        # Claude asks before saving its own memory notes when its config
+        # folder is not the one holding them (pooled Subrouter sessions use a
+        # proxy config folder). A rule answers only when the file resolves to
+        # <root>/projects/<project>/memory/<name>.md under a memory root.
+        "prompt_rules": [
+            {"question": r"^Do you want to (create|overwrite|make this edit to|make these edits to) \S+\?$",
+             "files": "claude-memory", "answer": "1",
+             "note": "Claude saving one of its own memory notes."},
+            {"question": r"^Do you want to proceed\?$",
+             "files": "claude-memory", "answer": "1",
+             "note": "Claude editing its own memory notes with a shell command."},
+        ],
+        "memory_roots": ["~/.claude", "~/.subrouter/codex/claude-proxy/*"],
     },
 }
 
@@ -549,7 +572,10 @@ def detect_agent(tail: str, profiles: dict) -> str:
         if profile.enabled and profile.rules.get("detect_composer") and bordered_composer_index(lines) >= 0:
             return name
     lowered = tail.lower()
-    for name, profile in profiles.items():
+    # Structural agents first: their text markers are specific, while the
+    # Codex ones ("gpt-") are plain text another agent's transcript can quote.
+    ordered = sorted(profiles.items(), key=lambda item: not item[1].rules.get("detect_composer"))
+    for name, profile in ordered:
         if profile.enabled and any(marker in lowered for marker in profile.detect_contains):
             return name
     return ""
@@ -580,6 +606,11 @@ class Watcher:
     surface: str
     title: str = ""
     agent: str = "codex"
+    workspace: str = ""
+    prompt_fingerprint: str = ""   # the permission prompt currently on screen
+    prompt_since: float = 0.0
+    prompt_reported: bool = False  # an unanswered prompt is reported once
+    prompt_attempts: int = 0
     last_fingerprint: str = ""
     actions_on_stop: int = 0
     next_action_at: float = 0.0
@@ -608,10 +639,24 @@ class Config:
     ignore_rules: tuple = (set(), [], True)
 
 
+# Each log rolls over at this size and keeps one previous file, so a host
+# never holds more than about twice this per log.
+LOG_ROTATE_BYTES = 20 * 1024 * 1024
+
+
+def rotate_if_large(path: str) -> None:
+    try:
+        if os.path.getsize(path) >= LOG_ROTATE_BYTES:
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
+
+
 def log(cfg: Config, message: str) -> None:
     line = f"{datetime.now().isoformat(timespec='seconds')} {message}"
     print(line, flush=True)
     if cfg.log_file:
+        rotate_if_large(cfg.log_file)
         with open(cfg.log_file, "a") as handle:
             handle.write(line + "\n")
 
@@ -623,9 +668,12 @@ def record(cfg: Config, event: str, **fields) -> None:
     watcher = cfg.watchers.get(fields.get("surface", ""))
     if watcher and "agent" not in fields:
         fields["agent"] = watcher.agent
+    if watcher and watcher.workspace and "workspace" not in fields:
+        fields["workspace"] = watcher.workspace
     payload = {"ts": datetime.now().isoformat(timespec="seconds"),
                "host": socket.gethostname(), "v": WATCHDOG_VERSION, "event": event, **fields}
     try:
+        rotate_if_large(cfg.stats_file)
         with open(cfg.stats_file, "a") as handle:
             handle.write(json.dumps(payload) + "\n")
     except Exception:
@@ -1032,12 +1080,14 @@ def app_surfaces(cli: str) -> list:
     except Exception:
         windows = []
     workspace_ids = []
+    workspace_titles = {}
     for window in windows or [None]:
         extra = ("--window", window) if window else ()
         raw = cmux("list-workspaces", "--json", "--id-format", "both", *extra, cli=cli)
         data = json.loads(raw)
         workspaces = data if isinstance(data, list) else data.get("workspaces", [])
         workspace_ids += [w.get("id") for w in workspaces if w.get("id")]
+        workspace_titles.update({w.get("id"): (w.get("title") or "") for w in workspaces if w.get("id")})
     surface_re = re.compile(r"surface:\d+\s+([0-9A-Fa-f-]{36})\s*(.*)")
     found = []
     for wid in dict.fromkeys(workspace_ids):
@@ -1051,8 +1101,27 @@ def app_surfaces(cli: str) -> list:
                 listing = cmux("list-pane-surfaces", "--workspace", wid, *extra, "--id-format", "both", cli=cli)
             except Exception:
                 continue
-            found += surface_re.findall(listing)
+            found += [(sid, title, workspace_titles.get(wid, "")) for sid, title in surface_re.findall(listing)]
     return found
+
+
+def recorded_agents(cli: str) -> dict:
+    """surface id -> agent from cmux's own session records, newest record
+    per surface. Screens alone can't name the agent while a permission
+    prompt hides its composer."""
+    try:
+        data = json.loads(cmux("sessions", "list", "--json", "--all", cli=cli))
+    except Exception:
+        return {}
+    newest = {}
+    for session in data.get("sessions", []) if isinstance(data, dict) else []:
+        surface, agent = session.get("surface_id"), session.get("agent")
+        if not surface or agent not in PROFILES:
+            continue
+        stamp = session.get("updated_at_unix") or 0
+        if surface not in newest or stamp >= newest[surface][1]:
+            newest[surface] = (agent, stamp)
+    return {surface: agent for surface, (agent, _) in newest.items()}
 
 
 def discover_app(cfg: Config, witnesses: dict, cli: str) -> None:
@@ -1061,16 +1130,19 @@ def discover_app(cfg: Config, witnesses: dict, cli: str) -> None:
     except Exception as exc:
         log(cfg, f"discovery: listing failed via {cli}: {exc}")
         return
-    for sid, title in surfaces:
+    recorded = recorded_agents(cli)
+    for sid, title, workspace in surfaces:
         title = title.replace("[selected]", "").strip()
         SURFACE_CLI[sid] = cli
         try:
             tail = read_tail(sid, lines=DISCOVERY_LINES)
         except Exception:
             continue
-        agent = detect_agent(tail, PROFILES)
+        agent = detect_agent(tail, PROFILES) or (recorded.get(sid, "") if PROFILES.get(recorded.get(sid, ""), None) and PROFILES[recorded[sid]].enabled else "")
         existing = cfg.watchers.get(sid)
         if existing:
+            existing.workspace = workspace or existing.workspace
+            existing.title = title or existing.title
             if agent and agent != existing.agent and not screen_matches(existing.profile, tail) \
                     and not existing.pending and existing.actions_on_stop == 0:
                 log(cfg, f"discovery: {sid} now runs {agent} (was {existing.agent})")
@@ -1083,9 +1155,9 @@ def discover_app(cfg: Config, witnesses: dict, cli: str) -> None:
         if is_ignored(cfg.ignore_rules, sid, title):
             log(cfg, f"discovery: ignoring excluded session {sid} ({title})")
             continue
-        cfg.watchers[sid] = Watcher(surface=sid, title=title, agent=agent,
+        cfg.watchers[sid] = Watcher(surface=sid, title=title, agent=agent, workspace=workspace,
                                     last_seen_busy=witnesses.get(sid, 0.0))
-        log(cfg, f"discovery: now watching {agent} session {sid} ({title})")
+        log(cfg, f"discovery: now watching {agent} session {sid} ({title} in {workspace})")
 
 
 def report(stats_file: str) -> int:
@@ -1233,6 +1305,243 @@ def report(stats_file: str) -> int:
     return 0
 
 
+PROMPT_OPTION_LINE = re.compile(r"^[❯›>]?\s*1\.\s+\S")
+PROMPT_FILE_TOKEN = re.compile(r"(\S+\.[A-Za-z0-9]+)\?$")
+ALLOW_ACCESS_DIRS = re.compile(r"allow access to\s*(.+?)(?: for this session|\(shift\+tab\)|$)")
+# A permission prompt is answered only after it has sat unchanged this long:
+# a tab waiting on a person is quiet, and a prompt still drawing is not read.
+PROMPT_QUIET_SECONDS = 5.0
+# An unanswered prompt older than this is reported as waiting on a person.
+PROMPT_WAITING_REPORT_SECONDS = 300.0
+
+
+def find_pending_prompt(tail: str):
+    """The permission prompt the screen ends on, if any: a question line,
+    numbered options and an "Esc to cancel" hint at the bottom. Returns
+    (question, file, header_lines, option_lines) or None."""
+    lines = tail.rstrip("\n").split("\n")
+    end = len(lines)
+    while end > 0 and not lines[end - 1].strip():
+        end -= 1
+    if "esc to cancel" not in "\n".join(lines[max(0, end - 8):end]).lower():
+        return None
+    option = -1
+    for i in range(end - 1, max(-1, end - 20), -1):
+        if PROMPT_OPTION_LINE.match(lines[i].strip()):
+            option = i
+            break
+    if option < 0:
+        return None
+    for i in range(option - 1, max(-1, option - 5), -1):
+        question = lines[i].strip()
+        if not question.endswith("?"):
+            continue
+        start = i
+        # A long file name wraps the question; a wrapped remainder does not
+        # start with a capital.
+        while start > 0 and i - start < 2 and not question[:1].isupper():
+            prev = lines[start - 1].strip()
+            if not prev or not prev.strip("─━-╌") or prev.endswith("?"):
+                break
+            start -= 1
+            question = prev + " " + question
+        match = PROMPT_FILE_TOKEN.search(question)
+        file = os.path.basename(match.group(1)) if match else ""
+        return question, file, lines[max(0, start - 60):start], lines[option:end]
+    return None
+
+
+def _unwrap(lines) -> str:
+    """Rejoin lines the terminal wrapped, keeping a path broken mid-token
+    whole."""
+    out = ""
+    for raw in lines:
+        line = raw.strip().strip("│|").strip()
+        if not line:
+            continue
+        if out and (out[-1] in "/-_." or (line.startswith("/") and not out.endswith(" "))):
+            out += line
+        else:
+            out += (" " if out else "") + line
+    return out
+
+
+def _path_token(token: str) -> str:
+    """A path-like word without surrounding quotes or trailing punctuation.
+    Leading dots are part of the path (`../`, `.claude/`) and stay."""
+    return token.strip("'\"`()").rstrip(".,;:")
+
+
+def _expand_roots(roots) -> list:
+    import glob
+    expanded = []
+    for root in roots:
+        for path in glob.glob(os.path.expanduser(root)) or [os.path.expanduser(root)]:
+            expanded.append(os.path.realpath(path))
+    return expanded
+
+
+def is_claude_memory_note(path: str, roots: list) -> bool:
+    """`path` is absolute and names <root>/projects/<project>/memory/<n>.md
+    for one of the memory roots, after resolving symlinks in its folder. A
+    file that merely shares a memory note's name elsewhere never matches."""
+    if not path.startswith("/") or not path.endswith(".md"):
+        return False
+    folder = os.path.realpath(os.path.dirname(os.path.normpath(path)))
+    if not os.path.basename(path):
+        return False
+    for root in roots:
+        projects = os.path.join(root, "projects") + "/"
+        if folder.startswith(projects):
+            rest = folder[len(projects):].split("/")
+            if len(rest) == 2 and rest[0] and rest[1] == "memory":
+                return True
+    return False
+
+
+def prompt_memory_paths(file: str, header, options, cwd: str) -> list:
+    """Absolute candidates for the file a prompt asks to write: path tokens
+    in the header ending in that file (relative ones resolved against the
+    session's working directory), and the folders an "allow access to"
+    option names."""
+    candidates = []
+    for token in _unwrap(header).split():
+        token = _path_token(token)
+        if not token.endswith("/" + file):
+            continue
+        if token.startswith("/"):
+            candidates.append(token)
+        elif token.startswith("~/"):
+            candidates.append(os.path.expanduser(token))
+        elif cwd:
+            candidates.append(os.path.normpath(os.path.join(cwd, token)))
+    allow = ALLOW_ACCESS_DIRS.search(_unwrap(options))
+    if allow:
+        for folder in allow.group(1).split(","):
+            folder = folder.strip().rstrip(".")
+            if folder.startswith("/"):
+                candidates.append(os.path.join(folder, file))
+    return candidates
+
+
+def header_requests_only_memory_edit(header, roots: list) -> bool:
+    """A shell command's prompt: Claude says it "requested permissions to
+    edit/write" files; every path it names must be a memory note."""
+    text = _unwrap(header)
+    at = text.rfind("requested permissions to ")
+    if at < 0:
+        return False
+    request = text[at:]
+    if not request.startswith(("requested permissions to edit", "requested permissions to write")):
+        return False
+    paths = [os.path.expanduser(_path_token(t)) for t in request.split() if "/" in t]
+    return bool(paths) and all(is_claude_memory_note(t, roots) for t in paths)
+
+
+def prompt_rule_for(profile: Profile, prompt, cwd: str):
+    """(rule, reason): the first rule that answers the prompt, or None and
+    the reason none did, for the record."""
+    question, file, header, options = prompt
+    roots = _expand_roots(profile.rules.get("memory_roots", []))
+    reason = "no rule matches the question"
+    for rule in profile.rules.get("prompt_rules", []):
+        if not re.search(rule["question"], question):
+            continue
+        if rule.get("files") != "claude-memory":
+            return rule, ""
+        if file:
+            paths = prompt_memory_paths(file, header, options, cwd)
+            if paths and all(is_claude_memory_note(path, roots) for path in paths):
+                return rule, ""
+            reason = "file is not a Claude memory note" if paths else "could not resolve the file's path"
+        elif header_requests_only_memory_edit(header, roots):
+            return rule, ""
+        else:
+            reason = "the command touches more than Claude memory notes"
+    return None, reason
+
+
+_SESSION_CWDS: dict = {}
+
+
+def session_cwd(surface: str) -> str:
+    """The agent's working directory from cmux's session records, used to
+    resolve a relative path in a prompt. Cached; "" when unknown."""
+    cached = _SESSION_CWDS.get(surface)
+    if cached and time.time() - cached[1] < 300:
+        return cached[0]
+    cwd = ""
+    try:
+        data = json.loads(cmux("sessions", "list", "--json", "--surface", surface,
+                               cli=SURFACE_CLI.get(surface, "")))
+        for session in data.get("sessions", []):
+            cwd = session.get("cwd") or session.get("launch_working_directory") or ""
+            if cwd:
+                break
+    except Exception:
+        cwd = ""
+    _SESSION_CWDS[surface] = (cwd, time.time())
+    return cwd
+
+
+def handle_prompt(cfg: Config, watcher: Watcher, tail: str, prompt) -> None:
+    """Answer a quiet prompt a rule covers, and record every prompt either
+    way, so a prompt waiting on a person shows up in the fleet report."""
+    question, file, header, _options = prompt
+    fp = hashlib.sha1(f"{question}\n{_unwrap(header[-6:])}".encode()).hexdigest()[:12]
+    now = time.time()
+    if fp != watcher.prompt_fingerprint:
+        watcher.prompt_fingerprint = fp
+        watcher.prompt_since = now
+        watcher.prompt_reported = False
+        watcher.prompt_attempts = 0
+        return
+    if now - watcher.prompt_since < PROMPT_QUIET_SECONDS:
+        return
+    profile = watcher.profile
+    rule, reason = prompt_rule_for(profile, prompt, session_cwd(watcher.surface))
+    blocked = ""
+    if not rule:
+        blocked = reason
+    elif not profile.rules.get("answer_prompts"):
+        blocked = "prompt answering is off for this agent"
+    elif is_ignored(cfg.ignore_rules, watcher.surface, watcher.title):
+        blocked = "session is excluded"
+    if blocked:
+        if not watcher.prompt_reported and now - watcher.prompt_since >= PROMPT_WAITING_REPORT_SECONDS:
+            watcher.prompt_reported = True
+            log(cfg, f"{watcher.surface}: prompt waiting on a person ({blocked}): {question!r}")
+            record(cfg, "prompt_waiting", surface=watcher.surface, title=watcher.title,
+                   workspace=watcher.workspace, question=question[:200], file=file, reason=blocked,
+                   waiting_s=round(now - watcher.prompt_since, 1))
+        return
+    if watcher.prompt_attempts >= 2:
+        if not watcher.prompt_reported:
+            watcher.prompt_reported = True
+            log(cfg, f"{watcher.surface}: answered {question!r} twice and it is still showing; leaving it")
+            record(cfg, "prompt_answer_failed", surface=watcher.surface, title=watcher.title,
+                   workspace=watcher.workspace, question=question[:200], file=file)
+        return
+    watcher.prompt_attempts += 1
+    if cfg.dry_run:
+        log(cfg, f"{watcher.surface}: DRY-RUN would answer {rule['answer']!r} to {question!r}")
+        return
+    try:
+        cmux("send", "--surface", watcher.surface, rule["answer"])
+        time.sleep(1.5)
+        after = find_pending_prompt(read_tail(watcher.surface, profile.tail_lines))
+    except Exception as exc:
+        log(cfg, f"{watcher.surface}: prompt answer failed: {exc}")
+        return
+    if after and after[0] == question:
+        return  # still showing: one more try on the next poll
+    log(cfg, f"{watcher.surface}: answered {rule['answer']!r} to {question!r} ({rule.get('note', '')})")
+    record(cfg, "prompt_answered", surface=watcher.surface, title=watcher.title,
+           workspace=watcher.workspace, question=question[:200], file=file,
+           answer=rule["answer"], waited_s=round(now - watcher.prompt_since, 1))
+    watcher.prompt_fingerprint = ""
+
+
 def poll_surface(cfg: Config, watcher: Watcher, pinned: set) -> bool:
     """One visit to one surface: classify, witness busy turns, act on a stop.
 
@@ -1242,6 +1551,11 @@ def poll_surface(cfg: Config, watcher: Watcher, pinned: set) -> bool:
     """
     try:
         tail = read_tail(watcher.surface, watcher.profile.tail_lines)
+        prompt = find_pending_prompt(tail)
+        if prompt:
+            handle_prompt(cfg, watcher, tail, prompt)
+            return False
+        watcher.prompt_fingerprint = ""
         state, marker = classify(tail, watcher.profile)
         if state == "retrying":
             # The agent is retrying on its own. That is neither a running
@@ -1334,7 +1648,7 @@ def poll_surface(cfg: Config, watcher: Watcher, pinned: set) -> bool:
                 record(cfg, "primed_stopped", surface=watcher.surface, title=watcher.title,
                        state=state, marker=marker)
                 return False
-        if state in ("goal-paused", "goal-paused-no-error", "capacity-stopped"):
+        if state in ("goal-paused", "goal-paused-no-error", "capacity-stopped") and watcher.profile.rules.get("resume", True):
             act(cfg, watcher, state, tail, marker)
     except Exception as exc:
         if watcher.surface in pinned:
@@ -1417,7 +1731,9 @@ def main() -> int:
             except Exception:
                 continue
         try:
-            agent = detect_agent(read_tail(surface, DISCOVERY_LINES), PROFILES) or "codex"
+            agent = (detect_agent(read_tail(surface, DISCOVERY_LINES), PROFILES)
+                     or recorded_agents(SURFACE_CLI.get(surface, "")).get(surface)
+                     or "codex")
         except Exception:
             agent = "codex"
         cfg.watchers[surface] = Watcher(surface=surface, agent=agent, last_seen_busy=witnesses.get(surface, 0.0))

@@ -11,13 +11,16 @@ and drive its mode from the test:
 "fail" returns the exact 503 body Subrouter returns when every Claude account
 is exhausted, so the client renders the same error a real session shows.
 "ok" streams a short reply after OK_DELAY seconds, long enough for a screen
-read to see the turn running. No model is ever called.
+read to see the turn running. "write:<path>" answers the next prompt with a
+Write tool call for <path>, so Claude shows its permission prompt, then
+replies with text once the tool result comes back. No model is ever called.
 """
 
 import json
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -72,6 +75,15 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 state["failed"] += 1
             return self._json(503, FAIL_BODY)
+        last = (request.get("messages") or [{}])[-1]
+        last_is_tool_result = any(isinstance(b, dict) and b.get("type") == "tool_result"
+                                  for b in (last.get("content") if isinstance(last.get("content"), list) else []))
+        offers_write = any(isinstance(t, dict) and t.get("name") == "Write" for t in request.get("tools") or [])
+        if mode.startswith("write:") and offers_write and not last_is_tool_result and request.get("stream"):
+            # One write per armed mode, so each prompt in a test is distinct.
+            with lock:
+                state["mode"] = "ok"
+            return self._tool_use(request, mode[len("write:"):])
         time.sleep(OK_DELAY)
         with lock:
             state["succeeded"] += 1
@@ -97,6 +109,36 @@ class Handler(BaseHTTPRequestHandler):
                                                "usage": {"output_tokens": 5}}))
         self.wfile.write(sse("message_stop", {"type": "message_stop"}))
         self.wfile.flush()
+
+
+def _tool_use_events(model: str, path: str) -> list:
+    message = {"id": "msg_stub_tool", "type": "message", "role": "assistant", "model": model,
+               "content": [], "stop_reason": None, "stop_sequence": None,
+               "usage": {"input_tokens": 10, "output_tokens": 1}}
+    tool_input = json.dumps({"file_path": path, "content": "---\nname: e2e-note\ndescription: stub\nmetadata:\n  type: project\n---\n\nstub note\n"})
+    return [
+        ("message_start", {"type": "message_start", "message": message}),
+        ("content_block_start", {"type": "content_block_start", "index": 0,
+                                 "content_block": {"type": "tool_use", "id": f"toolu_stub_{uuid.uuid4().hex[:12]}", "name": "Write", "input": {}}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                 "delta": {"type": "input_json_delta", "partial_json": tool_input}}),
+        ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                           "usage": {"output_tokens": 20}}),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+
+
+def _send_tool_use(handler, request: dict, path: str) -> None:
+    handler.send_response(200)
+    handler.send_header("content-type", "text/event-stream")
+    handler.end_headers()
+    for event, data in _tool_use_events(request.get("model", "stub"), path):
+        handler.wfile.write(sse(event, data))
+    handler.wfile.flush()
+
+
+Handler._tool_use = lambda self, request, path: _send_tool_use(self, request, path)
 
 
 if __name__ == "__main__":

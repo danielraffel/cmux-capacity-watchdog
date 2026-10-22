@@ -298,7 +298,7 @@ class DiscoveryTest(unittest.TestCase):
             if args[0] == "list-windows":
                 return f"  0: {win} selected_workspace={ws} workspaces=1\n"
             if args[0] == "list-workspaces":
-                return '{"workspaces": [{"id": "%s"}]}' % ws
+                return '{"workspaces": [{"id": "%s", "title": "pulp"}]}' % ws
             if args[0] == "list-panes":
                 return f"  pane:1 {pane_a}  [2 surfaces]\n* pane:2 {pane_b}  [1 surfaces]  [focused]\n"
             if args[0] == "list-pane-surfaces":
@@ -308,8 +308,98 @@ class DiscoveryTest(unittest.TestCase):
             raise AssertionError(args)
 
         with mock.patch.object(watchdog, "cmux", fake):
-            found = [sid for sid, _ in watchdog.app_surfaces("cli")]
-        self.assertEqual(sorted(found), sorted([hidden, focused]))
+            surfaces = watchdog.app_surfaces("cli")
+        self.assertEqual(sorted(sid for sid, _, _ in surfaces), sorted([hidden, focused]))
+        self.assertEqual({workspace for _, _, workspace in surfaces}, {"pulp"})
+
+
+class PromptAnswerTest(unittest.TestCase):
+    """Real Claude Code 2.1.307 permission prompt, captured against the stub."""
+
+    FAKE_ROOT = "/tmp/ccw-e2e/fake/.claude"
+    CWD = "/private/tmp/ccw-e2e/work"
+
+    def profile(self, **rules):
+        overrides = {"memory_roots_add": [self.FAKE_ROOT]}
+        overrides.update(rules)
+        return watchdog.build_profiles({"claude": overrides})["claude"]
+
+    def test_memory_note_prompt_is_found_and_matched(self):
+        prompt = watchdog.find_pending_prompt(fixture("claude-memory-write-prompt.txt"))
+        self.assertEqual(prompt[0], "Do you want to create e2e-note.md?")
+        self.assertEqual(prompt[1], "e2e-note.md")
+        rule, _ = watchdog.prompt_rule_for(self.profile(), prompt, self.CWD)
+        self.assertIsNotNone(rule)
+        # Without a known working directory the "allow access to" folders
+        # in the options still name the absolute memory folder.
+        rule, _ = watchdog.prompt_rule_for(self.profile(), prompt, "")
+        self.assertIsNotNone(rule)
+
+    def test_a_memory_shaped_path_outside_the_roots_is_refused(self):
+        prompt = watchdog.find_pending_prompt(fixture("claude-memory-write-prompt.txt"))
+        rule, reason = watchdog.prompt_rule_for(watchdog.build_profiles({})["claude"], prompt, self.CWD)
+        self.assertIsNone(rule)
+        self.assertEqual(reason, "file is not a Claude memory note")
+
+    def test_repo_local_claude_folder_and_stray_memory_md_are_refused(self):
+        roots = watchdog._expand_roots(["~/.claude"])
+        home = os.path.expanduser("~")
+        self.assertTrue(watchdog.is_claude_memory_note(f"{home}/.claude/projects/p/memory/note.md", roots))
+        self.assertFalse(watchdog.is_claude_memory_note("/tmp/repo/.claude/projects/p/memory/note.md", roots))
+        self.assertFalse(watchdog.is_claude_memory_note("/tmp/repo/MEMORY.md", roots))
+        self.assertFalse(watchdog.is_claude_memory_note(f"{home}/.claude/projects/p/memory/sub/note.md", roots))
+        self.assertFalse(watchdog.is_claude_memory_note(f"{home}/.claude/projects/p/memory/note.sh", roots))
+        # A relative path that only looks like a memory note resolves
+        # inside the repository, not the user's Claude folder.
+        candidates = watchdog.prompt_memory_paths(
+            "note.md", [" .claude/projects/p/memory/note.md"], [], "/tmp/repo")
+        self.assertEqual(candidates, ["/tmp/repo/.claude/projects/p/memory/note.md"])
+        self.assertFalse(watchdog.is_claude_memory_note(candidates[0], roots))
+
+    def run_prompt(self, profile, since_offset):
+        sends, events = [], []
+        watcher = make_watcher("P", agent="claude")
+        prompt = watchdog.find_pending_prompt(fixture("claude-memory-write-prompt.txt"))
+        cfg = make_cfg()
+        cfg.watchers = {"P": watcher}
+        tail = fixture("claude-memory-write-prompt.txt")
+        with mock.patch.dict(watchdog.PROFILES, {"claude": profile}), \
+             mock.patch.object(watchdog, "session_cwd", lambda surface: self.CWD), \
+             mock.patch.object(watchdog, "cmux", lambda *args, **kw: sends.append(args) or ""), \
+             mock.patch.object(watchdog, "read_tail", return_value="answered\n"), \
+             mock.patch.object(watchdog.time, "sleep", lambda s: None), \
+             mock.patch.object(watchdog, "record",
+                               lambda cfg, event, **fields: events.append(event)):
+            watchdog.handle_prompt(cfg, watcher, tail, prompt)   # first sighting
+            watchdog.handle_prompt(cfg, watcher, tail, prompt)   # not quiet yet
+            self.assertEqual(sends, [])
+            watcher.prompt_since -= since_offset
+            watchdog.handle_prompt(cfg, watcher, tail, prompt)
+        return sends, events
+
+    def test_answers_a_quiet_memory_prompt_when_enabled(self):
+        sends, events = self.run_prompt(self.profile(answer_prompts=True), 6)
+        self.assertEqual(sends, [("send", "--surface", "P", "1")])
+        self.assertEqual(events, ["prompt_answered"])
+
+    def test_disabled_answering_types_nothing_and_reports_a_long_wait(self):
+        sends, events = self.run_prompt(self.profile(), 6)
+        self.assertEqual((sends, events), ([], []))
+        sends, events = self.run_prompt(self.profile(), watchdog.PROMPT_WAITING_REPORT_SECONDS + 1)
+        self.assertEqual(sends, [])
+        self.assertEqual(events, ["prompt_waiting"])
+
+
+class LogRotationTest(unittest.TestCase):
+    def test_log_rolls_over_at_the_size_limit(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "stats.jsonl")
+        with open(path, "w") as handle:
+            handle.write("x")
+        with mock.patch.object(watchdog, "LOG_ROTATE_BYTES", 1):
+            watchdog.rotate_if_large(path)
+        self.assertFalse(os.path.exists(path))
+        self.assertTrue(os.path.exists(path + ".1"))
 
 
 class RulesFileTest(unittest.TestCase):
