@@ -11,7 +11,7 @@ one exception: a draft that exactly matches the resume command is submitted with
 Enter (it is either our own orphaned send from before a restart or the user's
 identical intent), bounded to a few attempts.
 
-Steady-state polls are cheap (every minute by default). Recovery is
+Steady-state polls are cheap (every 15 seconds by default). Recovery is
 round-robin: each visit makes at most one attempt per session, the backoff
 schedule persists per session in next_action_at, and the loop wakes at the
 earlier of the next poll or the earliest due retry — so the fast lane keeps
@@ -71,7 +71,7 @@ INSTANCE_LOCK = None  # held for the process lifetime
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-10-22.8"
+WATCHDOG_VERSION = "2026-10-22.9"
 
 # Per-agent rules: how to recognise the agent's screen, when it is busy, what
 # its composer looks like, which on-screen errors are resume evidence, and
@@ -2417,7 +2417,7 @@ def main() -> int:
     parser.add_argument("--surface", action="append", default=[], help="cmux surface id or ref; repeatable")
     parser.add_argument("--all", action="store_true", help="discover every agent session cmux knows about (all enabled agents)")
     parser.add_argument("--all-codex", action="store_true", help=argparse.SUPPRESS)  # pre-Claude spelling of --all
-    parser.add_argument("--interval", type=float, default=60.0, help="seconds between steady-state polls (default 60; sends are time-gated by backoff, so faster polls never mean faster sends)")
+    parser.add_argument("--interval", type=float, default=15.0, help="seconds between steady-state polls (default 15; sends are time-gated by backoff, so faster polls never mean faster sends)")
     parser.add_argument("--dry-run", action="store_true", help="classify and log, never send")
     parser.add_argument("--log", default="", help="append actions to this file")
     parser.add_argument("--stats", default=os.path.expanduser("~/.local/state/cmux-capacity-watchdog.jsonl"),

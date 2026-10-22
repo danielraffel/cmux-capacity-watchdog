@@ -37,7 +37,7 @@ nightly). If a cmux app only accepts automation from processes it started
 Out of the box: **resume is on for Claude and Codex; answering prompts is off.**
 
 Change that in one file, `~/.config/cmux-capacity-watchdog/rules.json`.
-Create it if it doesn't exist. It's re-read every minute, so a change applies
+Create it if it doesn't exist. It's re-read on every check (every 15 seconds), so a change applies
 without restarting anything.
 
 | Setting | Default | What it does |
@@ -134,7 +134,7 @@ only by you, since they can quote what's on screen.
 **Prompts.**
 
 - It answers a prompt only after seeing it unchanged on two polls at least 5
-  seconds apart (about a minute at the default poll), and it re-reads the
+  seconds apart (about 20 seconds after it appears), and it re-reads the
   screen just before typing.
 - It answers the same prompt at most twice in a row and three times an hour.
   After that the prompt is left for you and reported.
