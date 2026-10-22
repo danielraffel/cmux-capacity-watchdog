@@ -7,7 +7,8 @@ cmux tabs, and types for you in two situations:
 | Situation | What it types | Agents |
 |---|---|---|
 | A turn stopped on a temporary provider error (model at capacity, overloaded, `API Error: 5xx`, a dropped or stalled response) | `continue`, or `/goal resume` for a Codex goal | Claude, Codex |
-| Claude asks permission to create or edit one of its own memory notes ("Do you want to create MEMORY.md?"); off until you turn it on | `1` (Yes) | Claude |
+| Claude asks permission to create or edit one of its own memory notes ("Do you want to create MEMORY.md?"); off until you turn it on | `1` (Yes), or "Yes, and always allow" | Claude |
+| Claude asks a multiple-choice question and marks one option "(Recommended)"; on with the line above, after 2 minutes | that option's number, then submits | Claude |
 
 Everything else (other permission prompts, a deliberate pause, a finished
 turn, an unsent draft) is left for you. It works with or without
@@ -45,6 +46,8 @@ without restarting anything.
 | `resume` | `true` | Type `continue` / `/goal resume` after a temporary provider error |
 | `answer_prompts` | `false` | Answer the permission prompts its prompt rules cover (Claude memory notes) |
 | `always_allow` | `true` | When answering, prefer "Yes, and always allow access to <memory folder>" |
+| `answer_recommended` | `true` | With `answer_prompts` on, pick the "(Recommended)" option of Claude's multiple-choice questions |
+| `recommended_delay` | `120` | Seconds a question waits for you before the Recommended option is picked |
 
 Each setting is per agent: put it under `"claude"` or `"codex"`.
 
@@ -160,8 +163,11 @@ only by you, since they can quote what's on screen.
   pending `Bash` call, and that call is a plain literal write to a memory
   note. There are two allowed forms:
   - `echo '<text>' >> <note>`;
-  - `cat >>? <note> <<'EOF'` with a quoted heredoc and nothing after its
-    closing delimiter.
+  - `cat >>? <note> <<'EOF'` with a quoted heredoc, followed by nothing or
+    by one `echo` of plain words.
+
+  Either form may first name the note in a variable
+  (`f=<note>; cat >> "$f" <<'EOF'`).
 
   Any other command is left for you.
 - When Claude offers "Yes, and always allow access to <folder>" and every
@@ -169,6 +175,15 @@ only by you, since they can quote what's on screen.
   `always_allow`, on by default), so Claude stops asking for later notes. It
   never picks an option that also switches the session to accept edits, or
   one that allows "similar commands".
+- Claude's multiple-choice questions (its AskUserQuestion tool) get the
+  option Claude marked "(Recommended)", once the question has waited
+  `recommended_delay` seconds:
+  - a multi-select question gets its Recommended options ticked;
+  - a dialog of several questions is answered one question at a time, and
+    its review screen is submitted only if every answer is a Recommended one;
+  - a question with no Recommended option, or more than one, is left for you.
+
+  To keep a tab's questions for yourself, list it in the `ignore` file.
 - Every answer is recorded, and so is every prompt left waiting more than 5
   minutes, with the reason it wasn't answered.
 - A **near miss** is a prompt whose question a rule answers but whose file

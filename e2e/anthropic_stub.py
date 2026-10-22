@@ -13,7 +13,9 @@ is exhausted, so the client renders the same error a real session shows.
 "ok" streams a short reply after OK_DELAY seconds, long enough for a screen
 read to see the turn running. "write:<path>" answers the next prompt with a
 Write tool call for <path>, so Claude shows its permission prompt, then
-replies with text once the tool result comes back. No model is ever called.
+replies with text once the tool result comes back. "ask" does the same with
+an AskUserQuestion call whose second option is marked "(Recommended)". No
+model is ever called.
 """
 
 import json
@@ -80,6 +82,11 @@ class Handler(BaseHTTPRequestHandler):
         last_is_tool_result = any(isinstance(b, dict) and b.get("type") == "tool_result"
                                   for b in (last.get("content") if isinstance(last.get("content"), list) else []))
         offers_write = any(isinstance(t, dict) and t.get("name") == "Write" for t in request.get("tools") or [])
+        offers_ask = any(isinstance(t, dict) and t.get("name") == "AskUserQuestion" for t in request.get("tools") or [])
+        if mode.startswith("ask") and offers_ask and not last_is_tool_result and request.get("stream"):
+            with lock:
+                state["mode"] = "ok"
+            return self._tool_use(request, "", mode)
         if mode.startswith("write:") and offers_write and not last_is_tool_result and request.get("stream"):
             # One write per armed mode, so each prompt in a test is distinct.
             with lock:
@@ -112,16 +119,35 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
-def _tool_use_events(model: str, path: str) -> list:
+ASK_INPUT = {"questions": [{
+    "question": "Which stub color should the e2e test use?", "header": "Color", "multiSelect": False,
+    "options": [{"label": "Red", "description": "The first option."},
+                {"label": "Blue (Recommended)", "description": "The option the watchdog should pick."},
+                {"label": "Green", "description": "The third option."}]}]}
+# "ask:multi": two single-choice questions and one multi-select.
+ASK_MULTI_INPUT = {"questions": ASK_INPUT["questions"] + [
+    {"question": "Which stub size should it use?", "header": "Size", "multiSelect": False,
+     "options": [{"label": "Small (Recommended)", "description": "Pick me."},
+                 {"label": "Large", "description": "Not me."}]},
+    {"question": "Which stub extras should it add?", "header": "Extras", "multiSelect": True,
+     "options": [{"label": "Logs (Recommended)", "description": "Pick me."},
+                 {"label": "Traces", "description": "Not me."}]}]}
+
+
+def _tool_use_events(model: str, path: str, kind: str = "write") -> list:
     message = {"id": "msg_stub_tool", "type": "message", "role": "assistant", "model": model,
                "content": [], "stop_reason": None, "stop_sequence": None,
                "usage": {"input_tokens": 10, "output_tokens": 1}}
     body = "".join(f"line {i} of a long memory note\n" for i in range(int(os.environ.get("STUB_NOTE_LINES", "1"))))
     tool_input = json.dumps({"file_path": path, "content": "---\nname: e2e-note\ndescription: stub\nmetadata:\n  type: project\n---\n\n" + body})
+    tool_name = "Write"
+    if kind.startswith("ask"):
+        tool_input = json.dumps(ASK_MULTI_INPUT if kind == "ask:multi" else ASK_INPUT)
+        tool_name = "AskUserQuestion"
     return [
         ("message_start", {"type": "message_start", "message": message}),
         ("content_block_start", {"type": "content_block_start", "index": 0,
-                                 "content_block": {"type": "tool_use", "id": f"toolu_stub_{uuid.uuid4().hex[:12]}", "name": "Write", "input": {}}}),
+                                 "content_block": {"type": "tool_use", "id": f"toolu_stub_{uuid.uuid4().hex[:12]}", "name": tool_name, "input": {}}}),
         ("content_block_delta", {"type": "content_block_delta", "index": 0,
                                  "delta": {"type": "input_json_delta", "partial_json": tool_input}}),
         ("content_block_stop", {"type": "content_block_stop", "index": 0}),
@@ -131,16 +157,16 @@ def _tool_use_events(model: str, path: str) -> list:
     ]
 
 
-def _send_tool_use(handler, request: dict, path: str) -> None:
+def _send_tool_use(handler, request: dict, path: str, kind: str = "write") -> None:
     handler.send_response(200)
     handler.send_header("content-type", "text/event-stream")
     handler.end_headers()
-    for event, data in _tool_use_events(request.get("model", "stub"), path):
+    for event, data in _tool_use_events(request.get("model", "stub"), path, kind):
         handler.wfile.write(sse(event, data))
     handler.wfile.flush()
 
 
-Handler._tool_use = lambda self, request, path: _send_tool_use(self, request, path)
+Handler._tool_use = lambda self, request, path, kind="write": _send_tool_use(self, request, path, kind)
 
 
 if __name__ == "__main__":

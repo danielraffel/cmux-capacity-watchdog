@@ -711,6 +711,20 @@ class PromptAnswerTest(unittest.TestCase):
         (rule, reason), _ = self.bash_verdict(heredoc.split("\n"), [heredoc])
         self.assertIsNotNone(rule, reason)
 
+    def test_a_heredoc_naming_the_note_in_a_variable_is_answered(self):
+        # Seen on m3: f=<note>; cat >> "$f" <<'EOF' ... EOF
+        heredoc = "f={memory}/note.md; cat >> \"$f\" <<'EOF'\n**Rule:** least-loaded host.\nEOF"
+        (rule, reason), _ = self.bash_verdict(heredoc.split("\n"), [heredoc])
+        self.assertIsNotNone(rule, reason)
+
+    def test_a_variable_used_for_anything_else_is_refused(self):
+        for command in ["f={memory}/note.md; cat >> \"$g\" <<'EOF'\nx\nEOF",
+                        "f={memory}/note.md; rm \"$f\"",
+                        "f=~/.zshrc; cat >> \"$f\" <<'EOF'\nx\nEOF",
+                        "f={memory}/note.md; cat >> \"$f\" <<'EOF'\nx\nEOF\nrm -rf ~"]:
+            (rule, _reason), _ = self.bash_verdict(command.split("\n"), [command])
+            self.assertIsNone(rule, command)
+
     def test_an_unquoted_or_extended_heredoc_is_refused(self):
         for command in ["cat >> {memory}/note.md <<EOF\n$(curl x)\nEOF",
                         "cat >> {memory}/note.md <<'EOF'\nx\nEOF\nrm -rf ~",
@@ -782,6 +796,79 @@ class PromptAnswerTest(unittest.TestCase):
         sends, events = self.run_prompt(self.profile(), watchdog.PROMPT_WAITING_REPORT_SECONDS + 1)
         self.assertEqual(sends, [])
         self.assertEqual(events, ["prompt_waiting"])
+
+
+class RecommendedChoiceTest(unittest.TestCase):
+    """Claude's AskUserQuestion dialogs, captured from Claude Code 2.1.307
+    against e2e/anthropic_stub.py (modes ask and ask:multi)."""
+
+    def keys(self, name):
+        choice = watchdog.find_choice_dialog(fixture(name))
+        self.assertIsNotNone(choice, name)
+        return watchdog.choice_keys(choice)
+
+    def test_a_single_question_picks_its_recommended_option(self):
+        self.assertEqual(self.keys("claude-ask-single-recommended.txt"), (("2",), ""))
+
+    def test_each_question_of_a_multi_question_dialog_is_answered(self):
+        self.assertEqual(self.keys("claude-ask-multi-q1.txt"), (("2",), ""))
+        self.assertEqual(self.keys("claude-ask-multi-q2.txt"), (("1",), ""))
+        # Multi-select: tick the Recommended option, then Tab onward.
+        self.assertEqual(self.keys("claude-ask-multi-q3.txt"), (("1", "<tab>"), ""))
+
+    def test_the_review_screen_is_submitted_when_every_answer_is_recommended(self):
+        self.assertEqual(self.keys("claude-ask-multi-submit.txt"), (("1",), ""))
+        changed = fixture("claude-ask-multi-submit.txt").replace("→ Small (Recommended)", "→ Large")
+        self.assertEqual(watchdog.choice_keys(watchdog.find_choice_dialog(changed)),
+                         ((), "an answer other than the Recommended one was chosen"))
+
+    def test_no_or_several_recommended_options_are_left_for_a_person(self):
+        screen = fixture("claude-ask-single-recommended.txt")
+        none = watchdog.find_choice_dialog(screen.replace(" (Recommended)", ""))
+        self.assertEqual(watchdog.choice_keys(none), ((), "no option is marked Recommended"))
+        both = watchdog.find_choice_dialog(screen.replace("1. Red", "1. Red (Recommended)"))
+        self.assertEqual(watchdog.choice_keys(both), ((), "several options are marked Recommended"))
+
+    def test_a_tab_showing_a_question_is_recognized_as_claude(self):
+        profiles = watchdog.build_profiles({})
+        self.assertEqual(watchdog.detect_agent(fixture("claude-ask-multi-q1.txt"), profiles), "claude")
+
+    def test_other_screens_are_not_choice_dialogs(self):
+        for name in ["claude-memory-write-prompt.txt", "claude-503-final-error.txt",
+                     "claude-busy-spinner-queued.txt", "claude-trust-dialog.txt"]:
+            self.assertIsNone(watchdog.find_choice_dialog(fixture(name)), name)
+
+    def run_choice(self, rules, waited):
+        sends, events = [], []
+        watcher = make_watcher("Q", agent="claude")
+        profile = watchdog.build_profiles({"claude": rules})["claude"]
+        screen = fixture("claude-ask-single-recommended.txt")
+        choice = watchdog.find_choice_dialog(screen)
+        cfg = make_cfg()
+        with mock.patch.dict(watchdog.PROFILES, {"claude": profile}), \
+             mock.patch.object(watchdog, "cmux", lambda *args, **kw: sends.append(args) or ""), \
+             mock.patch.object(watchdog, "read_tail", side_effect=[screen, "answered\n"]), \
+             mock.patch.object(watchdog.time, "sleep", lambda s: None), \
+             mock.patch.object(watchdog, "record", lambda cfg, event, **f: events.append((event, f))):
+            watchdog.handle_choice(cfg, watcher, screen, choice)   # first sighting
+            watcher.prompt_since -= 10
+            watcher.choice_since -= waited
+            watchdog.handle_choice(cfg, watcher, screen, choice)
+        return sends, events
+
+    def test_recommended_is_picked_only_after_the_delay(self):
+        sends, _ = self.run_choice({"answer_prompts": True}, waited=30)
+        self.assertEqual(sends, [])
+        sends, events = self.run_choice({"answer_prompts": True}, waited=130)
+        self.assertEqual(sends, [("send", "--force", "--surface", "Q", "2")])
+        self.assertEqual(events[-1][0], "prompt_answered")
+        self.assertEqual(events[-1][1]["answer"], "recommended: Blue (Recommended)")
+
+    def test_nothing_is_picked_when_answering_is_off(self):
+        sends, _ = self.run_choice({}, waited=600)
+        self.assertEqual(sends, [])
+        sends, _ = self.run_choice({"answer_prompts": True, "answer_recommended": False}, waited=600)
+        self.assertEqual(sends, [])
 
 
 class LogRotationTest(unittest.TestCase):

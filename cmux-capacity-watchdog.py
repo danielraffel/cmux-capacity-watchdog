@@ -71,7 +71,7 @@ INSTANCE_LOCK = None  # held for the process lifetime
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-10-22.6"
+WATCHDOG_VERSION = "2026-10-22.7"
 
 # Per-agent rules: how to recognise the agent's screen, when it is busy, what
 # its composer looks like, which on-screen errors are resume evidence, and
@@ -192,6 +192,13 @@ DEFAULT_PROFILES = {
         # for later notes. Never chosen when that option also changes the
         # session's mode or allows "similar commands".
         "always_allow": True,
+        # Claude's multiple-choice questions (AskUserQuestion): pick the
+        # option Claude marked "(Recommended)" once the question has waited
+        # this many seconds, so a person can answer first. Needs
+        # answer_prompts. A question with no single Recommended option is
+        # left for a person.
+        "answer_recommended": True,
+        "recommended_delay": 120,
     },
 }
 
@@ -626,6 +633,16 @@ def screen_matches(profile: Profile, tail: str) -> bool:
     return any(marker in lowered for marker in profile.detect_contains)
 
 
+def discovery_tail(surface: str) -> str:
+    """A short read for agent detection, or a long one when the screen ends
+    on a multiple-choice question, whose tab bar sits well above its footer."""
+    tail = read_tail(surface, lines=DISCOVERY_LINES)
+    last = next((line.strip().lower() for line in reversed(tail.splitlines()) if line.strip()), "")
+    if "enter to select" in last and "esc to cancel" in last:
+        tail = read_tail(surface, lines=120)
+    return tail
+
+
 def detect_agent(tail: str, profiles: dict) -> str:
     """Which enabled agent this screen belongs to, or "". Claude's framed
     composer is checked first: it is structural, while the Codex markers are
@@ -639,7 +656,8 @@ def detect_agent(tail: str, profiles: dict) -> str:
     # A Claude permission prompt's footer, as the screen's last line. Text
     # quoted higher up (a README, a transcript) doesn't count.
     last = next((line.strip().lower() for line in reversed(lines) if line.strip()), "")
-    if "esc to cancel" in last and "tab to amend" in last:
+    # Or Claude's multiple-choice question (its question tabs and footer).
+    if ("esc to cancel" in last and "tab to amend" in last) or find_choice_dialog(tail):
         for name, profile in profiles.items():
             if profile.enabled and profile.rules.get("detect_composer"):
                 return name
@@ -687,6 +705,7 @@ class Watcher:
     was_busy: bool = False  # last poll saw a running turn
     near_misses: set = field(default_factory=set)  # prompt fingerprints already captured
     prompt_recheck_at: float = 0.0  # wake early to confirm a new prompt is quiet
+    choice_since: float = 0.0  # a multiple-choice dialog has been showing since
     last_fingerprint: str = ""
     actions_on_stop: int = 0
     next_action_at: float = 0.0
@@ -1232,7 +1251,7 @@ def discover_app(cfg: Config, witnesses: dict, cli: str) -> None:
         title = title.replace("[selected]", "").strip()
         SURFACE_CLI[sid] = cli
         try:
-            tail = read_tail(sid, lines=DISCOVERY_LINES)
+            tail = discovery_tail(sid)
         except Exception:
             continue
         agent = detect_agent(tail, PROFILES) or (recorded.get(sid, "") if PROFILES.get(recorded.get(sid, ""), None) and PROFILES[recorded[sid]].enabled else "")
@@ -1695,10 +1714,18 @@ MEMORY_HEREDOC = re.compile(
     r"\Acat >>? (/[^\s;&|<>`$'\"]+) <<'([A-Za-z_][A-Za-z0-9_]*)'\n(.*)\n\2(?:\necho [A-Za-z0-9 .,:_-]*)?\Z", re.S)
 
 
+# Either form may first name the note in a variable: `f=<path>; cat >> "$f" …`.
+MEMORY_PATH_VARIABLE = re.compile(
+    r"\A([A-Za-z_][A-Za-z0-9_]*)=(/[^\s;&|<>`$'\"]+); (echo '[^']*' >>|cat >>?) \"\$\1\" ")
+
+
 def memory_write_target(command: str) -> str:
     """The memory-note path a shell command writes, if it is one of the two
     literal forms; "" for anything else."""
     command = command.strip()
+    variable = MEMORY_PATH_VARIABLE.match(command)
+    if variable:
+        command = f"{variable.group(3)} {variable.group(2)} " + command[variable.end():]
     append = MEMORY_APPEND.match(command)
     if append:
         return append.group(2)
@@ -2061,6 +2088,163 @@ def handle_prompt(cfg: Config, watcher: Watcher, tail: str, prompt) -> None:
     watcher.prompt_fingerprint = ""
 
 
+CHOICE_OPTION = re.compile(r"^ {0,3}(?:❯\s*)?(\d+)\.\s+(\[[ ✔]\]\s+)?(.*?)\s*$")
+CHOICE_TABS = re.compile(r"^\s*(?:←\s+)?[☐☒]\s")
+RECOMMENDED = "(Recommended)"
+
+
+def find_choice_dialog(tail: str):
+    """Claude's AskUserQuestion dialog at the bottom of the screen, or None.
+    Two shapes: a question ("Enter to select … Esc to cancel"), and the
+    review screen a multi-question dialog ends on ("Ready to submit your
+    answers?" / "1. Submit answers" / "2. Cancel")."""
+    lines = tail.rstrip("\n").split("\n")
+    end = len(lines)
+    while end > 0 and not lines[end - 1].strip():
+        end -= 1
+    if end == 0 or bordered_composer_index(lines[:end]) >= 0:
+        return None
+    tab = -1
+    for i in range(end - 1, max(-1, end - 120), -1):
+        if CHOICE_TABS.match(lines[i]):
+            tab = i
+            break
+    if tab < 0:
+        return None
+    tabs = lines[tab].strip()
+    last = lines[end - 1].strip()
+    if "enter to select" in last.lower() and "esc to cancel" in last.lower():
+        options, question = [], []
+        for line in lines[tab + 1:end - 1]:
+            match = CHOICE_OPTION.match(line)
+            if match:
+                options.append((int(match.group(1)), match.group(3), bool(match.group(2)),
+                                "✔" in (match.group(2) or "")))
+            elif not options and line.strip() and not is_rule(line):
+                question.append(line.strip().strip("│").strip())
+        if not options or [n for n, *_ in options] != list(range(1, len(options) + 1)):
+            return None
+        return {"kind": "question", "tabs": tabs, "question": " ".join(question),
+                "options": options, "multi_question": "Submit" in tabs}
+    filled = [i for i in range(tab + 1, end) if lines[i].strip()]
+    if len(filled) >= 3 and [lines[i].strip().lstrip("❯ ") for i in filled[-3:]] == \
+            ["Ready to submit your answers?", "1. Submit answers", "2. Cancel"] and "Submit" in tabs:
+        body = [line.strip() for line in lines[tab + 1:filled[-3]]]
+        asked = [line for line in body if line.startswith("●")]
+        answers = [line[1:].strip() for line in body if line.startswith("→")]
+        return {"kind": "submit", "tabs": tabs, "question": "Ready to submit your answers?",
+                "asked": asked, "answers": answers}
+    return None
+
+
+def choice_keys(choice) -> tuple:
+    """(keys to press, "") for the Recommended answer, or ((), reason)."""
+    if choice["kind"] == "submit":
+        answers = choice["answers"]
+        if not answers or len(answers) != len(choice["asked"]):
+            return (), "not every question is answered"
+        if not all(answer.endswith(RECOMMENDED) for answer in answers):
+            return (), "an answer other than the Recommended one was chosen"
+        return ("1",), ""
+    options = choice["options"]
+    recommended = [(n, checked) for n, label, _box, checked in options if label.endswith(RECOMMENDED)]
+    if not recommended:
+        return (), "no option is marked Recommended"
+    if any(box for _n, _label, box, _checked in options):
+        # Multi-select: tick each Recommended option, then Tab to the next
+        # question. Only inside a multi-question dialog, whose Submit tab
+        # reviews the answers.
+        if not choice["multi_question"]:
+            return (), "a single multi-select question"
+        return tuple(str(n) for n, checked in recommended if not checked) + ("<tab>",), ""
+    if len(recommended) != 1:
+        return (), "several options are marked Recommended"
+    return (str(recommended[0][0]),), ""
+
+
+def choice_fingerprint(choice) -> str:
+    text = json.dumps([choice["kind"], choice["tabs"], choice["question"],
+                       choice.get("options") or choice.get("answers")], ensure_ascii=False)
+    return hashlib.sha1(text.encode()).hexdigest()[:12]
+
+
+def handle_choice(cfg: Config, watcher: Watcher, tail: str, choice) -> None:
+    """Pick Claude's Recommended option in a multiple-choice question once it
+    has waited `recommended_delay` seconds, and submit a multi-question
+    dialog whose every answer is the Recommended one."""
+    profile = watcher.profile
+    question = choice["question"] or choice["tabs"]
+    fp = choice_fingerprint(choice)
+    now = time.time()
+    if not watcher.choice_since:
+        watcher.choice_since = now
+    delay = profile.rules.get("recommended_delay", 120) if choice["kind"] == "question" else 0
+    if fp != watcher.prompt_fingerprint:
+        watcher.prompt_fingerprint = fp
+        watcher.prompt_since = now
+        watcher.prompt_reported = False
+        watcher.prompt_attempts = 0
+        watcher.prompt_recheck_at = max(now + PROMPT_QUIET_SECONDS, watcher.choice_since + delay) + 1
+        return
+    if now - watcher.prompt_since < PROMPT_QUIET_SECONDS:
+        return
+    keys, blocked = choice_keys(choice)
+    if not blocked and not (profile.rules.get("answer_prompts") and profile.rules.get("answer_recommended")):
+        blocked = "picking Recommended options is off for this agent"
+    if not blocked and is_ignored(cfg.ignore_rules, watcher.surface, watcher.title):
+        blocked = "session is excluded"
+    if blocked:
+        if not watcher.prompt_reported and now - watcher.prompt_since >= PROMPT_WAITING_REPORT_SECONDS:
+            watcher.prompt_reported = True
+            log(cfg, f"{watcher.surface}: question waiting on a person ({blocked}): {question!r}")
+            record(cfg, "prompt_waiting", surface=watcher.surface, title=watcher.title,
+                   workspace=watcher.workspace, question=question[:200], file="", reason=blocked,
+                   waiting_s=round(now - watcher.prompt_since, 1))
+        return
+    if now - watcher.choice_since < delay:
+        watcher.prompt_recheck_at = watcher.choice_since + delay + 1
+        return
+    recent = [t for t in watcher.prompt_answers.get(fp, []) if now - t < 3600]
+    watcher.prompt_answers[fp] = recent
+    if watcher.prompt_attempts >= 2 or len(recent) >= PROMPT_MAX_ANSWERS_PER_HOUR:
+        if not watcher.prompt_reported:
+            watcher.prompt_reported = True
+            log(cfg, f"{watcher.surface}: picked Recommended for {question!r} twice and it is still showing; leaving it")
+            record(cfg, "prompt_answer_failed", surface=watcher.surface, title=watcher.title,
+                   workspace=watcher.workspace, question=question[:200], file="")
+        return
+    if cfg.dry_run:
+        log(cfg, f"{watcher.surface}: DRY-RUN would press {keys} for {question!r}")
+        return
+    watcher.prompt_attempts += 1
+    try:
+        current = find_choice_dialog(read_tail(watcher.surface, profile.tail_lines))
+        if not current or choice_fingerprint(current) != fp:
+            watcher.prompt_fingerprint = ""
+            return
+        for key in keys:
+            if key == "<tab>":
+                cmux("send-key", "--force", "--surface", watcher.surface, "tab")
+            else:
+                cmux("send", "--force", "--surface", watcher.surface, key)
+            time.sleep(0.5)
+        time.sleep(1.0)
+        after = find_choice_dialog(read_tail(watcher.surface, profile.tail_lines))
+    except Exception as exc:
+        log(cfg, f"{watcher.surface}: picking Recommended failed: {exc}")
+        return
+    watcher.prompt_answers.setdefault(fp, []).append(now)
+    if after and choice_fingerprint(after) == fp:
+        return  # unchanged: one more try on the next poll
+    label = "submit" if choice["kind"] == "submit" else next(
+        (l for n, l, _b, _c in choice["options"] if str(n) in keys), "")
+    log(cfg, f"{watcher.surface}: picked {label!r} for {question!r}")
+    record(cfg, "prompt_answered", surface=watcher.surface, title=watcher.title,
+           workspace=watcher.workspace, question=question[:200], file="",
+           answer=f"recommended: {label}"[:200], waited_s=round(now - watcher.choice_since, 1))
+    watcher.prompt_fingerprint = ""
+
+
 def poll_surface(cfg: Config, watcher: Watcher, pinned: set) -> bool:
     """One visit to one surface: classify, witness busy turns, act on a stop.
 
@@ -2070,6 +2254,11 @@ def poll_surface(cfg: Config, watcher: Watcher, pinned: set) -> bool:
     """
     try:
         tail = read_tail(watcher.surface, watcher.profile.tail_lines)
+        choice = find_choice_dialog(tail) if "answer_recommended" in watcher.profile.rules else None
+        if choice:
+            handle_choice(cfg, watcher, tail, choice)
+            return False
+        watcher.choice_since = 0.0
         prompt = find_pending_prompt(tail)
         if prompt:
             handle_prompt(cfg, watcher, tail, prompt)
@@ -2274,7 +2463,7 @@ def main() -> int:
             except Exception:
                 continue
         try:
-            agent = (detect_agent(read_tail(surface, DISCOVERY_LINES), PROFILES)
+            agent = (detect_agent(discovery_tail(surface), PROFILES)
                      or recorded_agents(SURFACE_CLI.get(surface, "")).get(surface)
                      or "codex")
         except Exception:

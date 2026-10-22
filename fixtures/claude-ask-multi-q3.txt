@@ -1,0 +1,31 @@
+
+ ▐▛███▛█   Claude Code v2.1.307
+▝▜██████▀  Sonnet 4.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/ccw-e2e/work
+
+
+❯ ask me a question                                                                                
+
+⏺ User answered Claude's questions:
+  ⎿  · Which stub color should the e2e test use? → Blue (Recommended)
+
+⏺ Resumed by the stub.
+
+✻ Baked for 24s · done 12:45 AM
+
+❯ ask me several                                                                                   
+───────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Color  ☒ Size  ☐ Extras  ✔ Submit  →
+
+Which stub extras should it add?
+
+❯ 1. [ ] Logs (Recommended)
+         Pick me.
+  2. [ ] Traces
+         Not me.
+  3. [ ] Type something
+     Submit
+───────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
