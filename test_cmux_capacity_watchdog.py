@@ -470,7 +470,7 @@ class PromptAnswerTest(unittest.TestCase):
         events, sends = [], []
         folder = tempfile.mkdtemp()
         with mock.patch.object(watchdog, "NEAR_MISS_DIR", folder), \
-             mock.patch.object(watchdog, "session_cwd", lambda surface: "/tmp/repo"), \
+             mock.patch.object(watchdog, "session_info", lambda surface: ("/tmp/repo", "")), \
              mock.patch.object(watchdog, "cmux", lambda *a, **k: sends.append(a) or ""), \
              mock.patch.object(watchdog, "record", lambda cfg, event, **f: events.append((event, f))):
             watchdog.handle_prompt(cfg, watcher, screen, prompt)
@@ -482,6 +482,74 @@ class PromptAnswerTest(unittest.TestCase):
         self.assertEqual(sends, [])
         with open(near[0]["capture"]) as handle:
             self.assertIn("Do you want to create CLAUDE.md?", handle.read())
+
+    def transcript(self, folder, calls, name="session.jsonl"):
+        """A transcript holding file tool calls; (id, path, answered)."""
+        path = os.path.join(folder, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            for call, target, answered in calls:
+                handle.write(json.dumps({"message": {"content": [
+                    {"type": "tool_use", "id": call, "name": "Write", "input": {"file_path": target}}]}}) + "\n")
+                if answered:
+                    handle.write(json.dumps({"message": {"content": [
+                        {"type": "tool_result", "tool_use_id": call}]}}) + "\n")
+        return path
+
+    def pooled_verdict(self, transcript):
+        # Subrouter-pooled sessions: a long preview hides the path and the
+        # options are only Yes / No, so the screen names no target at all.
+        prompt = watchdog.find_pending_prompt(fixture("claude-pooled-memory-prompt-no-path.txt"))
+        root = os.path.dirname(os.path.dirname(os.path.dirname(transcript)))  # <root>/projects/<p>/x.jsonl
+        profile = watchdog.build_profiles({"claude": {"memory_roots_add": [root]}})["claude"]
+        return watchdog.prompt_rule_for(profile, prompt, "/tmp/repo",
+                                        pending=lambda name: watchdog.pending_write_paths(transcript, name))
+
+    def make_root(self):
+        import tempfile
+        root = os.path.realpath(tempfile.mkdtemp())
+        return root, os.path.join(root, "projects", "p")
+
+    def test_a_pooled_prompt_is_matched_by_the_pending_tool_call(self):
+        root, project = self.make_root()
+        transcript = self.transcript(project, [
+            ("t1", "/tmp/repo/other.md", True),
+            ("t2", os.path.join(project, "memory", "pooled-note.md"), False),
+        ])
+        rule, reason = self.pooled_verdict(transcript)
+        self.assertIsNotNone(rule, reason)
+
+    def test_a_pending_repository_file_with_that_name_is_refused(self):
+        root, project = self.make_root()
+        transcript = self.transcript(project, [("t1", "/tmp/repo/pooled-note.md", False)])
+        rule, reason = self.pooled_verdict(transcript)
+        self.assertIsNone(rule)
+        self.assertEqual(reason, "file is not a Claude memory note")
+
+    def test_two_pending_writes_with_one_name_are_refused(self):
+        root, project = self.make_root()
+        transcript = self.transcript(project, [
+            ("t1", os.path.join(project, "memory", "pooled-note.md"), False),
+            ("t2", "/tmp/repo/pooled-note.md", False),
+        ])
+        rule, reason = self.pooled_verdict(transcript)
+        self.assertIsNone(rule)
+        self.assertEqual(reason, "several pending writes share this file name")
+
+    def test_a_subagent_write_is_found_in_its_own_transcript(self):
+        root, project = self.make_root()
+        transcript = self.transcript(project, [], name="abc.jsonl")
+        self.transcript(os.path.join(project, "abc", "subagents"),
+                        [("s1", os.path.join(project, "memory", "pooled-note.md"), False)], name="agent-x.jsonl")
+        rule, reason = self.pooled_verdict(transcript)
+        self.assertIsNotNone(rule, reason)
+
+    def test_no_transcript_evidence_leaves_the_prompt_for_a_person(self):
+        root, project = self.make_root()
+        transcript = self.transcript(project, [("t1", os.path.join(project, "memory", "pooled-note.md"), True)])
+        rule, reason = self.pooled_verdict(transcript)
+        self.assertIsNone(rule)
+        self.assertEqual(reason, "could not resolve the file's path")
 
     def test_a_rule_without_a_file_scope_never_answers(self):
         profile = watchdog.build_profiles({"claude": {"prompt_rules": [{"question": ".*", "answer": "1"}]}})["claude"]
@@ -498,7 +566,7 @@ class PromptAnswerTest(unittest.TestCase):
         cfg.watchers = {"P": watcher}
         tail = fixture("claude-memory-write-prompt.txt")
         with mock.patch.dict(watchdog.PROFILES, {"claude": profile}), \
-             mock.patch.object(watchdog, "session_cwd", lambda surface: self.CWD), \
+             mock.patch.object(watchdog, "session_info", lambda surface: (self.CWD, "")), \
              mock.patch.object(watchdog, "cmux", lambda *args, **kw: sends.append(args) or ""), \
              mock.patch.object(watchdog, "read_tail", side_effect=[tail, "answered\n"]), \
              mock.patch.object(watchdog.time, "sleep", lambda s: None), \

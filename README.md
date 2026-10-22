@@ -145,6 +145,12 @@ only by you, since they can quote what's on screen.
   - a project's own `.claude` folder;
   - a symlink out of the memory folder;
   - a relative path when the session's directory is unknown.
+- When the path has scrolled off and Claude lists no folder (Subrouter-pooled
+  sessions offer only Yes / No), the evidence is the pending tool call
+  itself. That's the `file_path` of the unanswered `Write` or `Edit` for
+  that file name, in the session's transcript or one of its subagents'.
+  Claude records it before asking. If two pending writes share the name,
+  the prompt is left for you.
 - Text the model writes (a file preview, a command's description) is never
   used as evidence.
 - Shell-command prompts are never answered: a command can't be shown to be

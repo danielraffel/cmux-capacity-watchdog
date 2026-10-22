@@ -71,7 +71,7 @@ INSTANCE_LOCK = None  # held for the process lifetime
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-10-22.3"
+WATCHDOG_VERSION = "2026-10-22.4"
 
 # Per-agent rules: how to recognise the agent's screen, when it is busy, what
 # its composer looks like, which on-screen errors are resume evidence, and
@@ -1640,10 +1640,12 @@ def prompt_memory_paths(file: str, header, options, cwd: str) -> list:
     return [path] + allowed
 
 
-def prompt_rule_for(profile: Profile, prompt, cwd: str):
+def prompt_rule_for(profile: Profile, prompt, cwd: str, pending=None):
     """(rule, reason): the first rule that answers the prompt, or None and
     the reason none did, for the record. Every rule must say which files it
-    covers; only "claude-memory" exists."""
+    covers; only "claude-memory" exists. `pending(file)` returns the target
+    paths of the session's unanswered file tool calls for that name, used
+    when the screen no longer shows the path."""
     question, file, header, options = prompt
     roots = _expand_roots(profile.rules.get("memory_roots", []))
     reason = "no rule matches the question"
@@ -1660,22 +1662,88 @@ def prompt_rule_for(profile: Profile, prompt, cwd: str):
             reason = "rule does not say which files it covers"
             continue
         paths = prompt_memory_paths(file, header, options, cwd) if file else []
+        if not paths and file and pending:
+            paths = pending(file)
+            if len(set(paths)) > 1:
+                # Two unanswered writes with this name: can't tell which one
+                # is asking.
+                return None, "several pending writes share this file name"
         if paths and all(is_claude_memory_note(path, roots) for path in paths):
             return rule, ""
         reason = "file is not a Claude memory note" if paths else "could not resolve the file's path"
     return None, reason
 
 
-_SESSION_CWDS: dict = {}
+FILE_TOOLS = ("Write", "Edit", "MultiEdit")
+# Only the end of a transcript can hold the call a prompt is asking about.
+TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024
 
 
-def session_cwd(surface: str) -> str:
-    """The agent's working directory from cmux's session records, used to
-    resolve a relative path in a prompt. Cached; "" when unknown."""
-    cached = _SESSION_CWDS.get(surface)
-    if cached and time.time() - cached[1] < 300:
+def _pending_file_calls(path: str, file: str) -> list:
+    """file_path of each file tool call in a transcript that has no result
+    yet and targets a file with this name."""
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - TRANSCRIPT_TAIL_BYTES))
+            data = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    calls, answered = {}, set()
+    for line in data.splitlines():
+        if file not in line and "tool_result" not in line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        message = row.get("message") if isinstance(row, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("name") in FILE_TOOLS:
+                target = (block.get("input") or {}).get("file_path")
+                if isinstance(target, str) and os.path.basename(target) == file:
+                    calls[block.get("id")] = target
+            elif block.get("type") == "tool_result":
+                answered.add(block.get("tool_use_id"))
+    return [target for call, target in calls.items() if call not in answered]
+
+
+def pending_write_paths(transcript: str, file: str) -> list:
+    """Targets of the session's unanswered file tool calls for `file`, from
+    its transcript and its subagents' (a subagent's write asks in the same
+    tab). This is the tool call Claude is asking permission for, recorded
+    by Claude before it asks, so unlike screen text it names the real
+    target."""
+    if not transcript or not file:
+        return []
+    files = [transcript]
+    subagents = os.path.join(os.path.splitext(transcript)[0], "subagents")
+    try:
+        recent = time.time() - 3600
+        files += [os.path.join(subagents, name) for name in os.listdir(subagents)
+                  if name.endswith(".jsonl") and os.path.getmtime(os.path.join(subagents, name)) > recent]
+    except OSError:
+        pass
+    found = []
+    for path in files:
+        found += _pending_file_calls(path, file)
+    return found
+
+
+_SESSION_INFO: dict = {}
+
+
+def session_info(surface: str) -> tuple:
+    """(working directory, transcript path) of the live agent session in a
+    surface, from cmux's session records. Cached briefly; "" when unknown."""
+    cached = _SESSION_INFO.get(surface)
+    if cached and time.time() - cached[1] < 60:
         return cached[0]
-    cwd = ""
+    info = ("", "")
     try:
         data = json.loads(cmux("sessions", "list", "--json", "--surface", surface,
                                cli=SURFACE_CLI.get(surface, "")))
@@ -1687,13 +1755,18 @@ def session_cwd(surface: str) -> str:
             # Claude draws a relative path against the directory it started
             # in, which can differ from where its shell later moved.
             cwd = session.get("launch_working_directory") or session.get("cwd") or ""
-            if isinstance(cwd, str) and cwd:
+            transcript = session.get("transcript_path") or ""
+            info = (cwd if isinstance(cwd, str) else "", transcript if isinstance(transcript, str) else "")
+            if info[0] or info[1]:
                 break
-            cwd = ""
     except Exception:
-        cwd = ""
-    _SESSION_CWDS[surface] = (cwd, time.time())
-    return cwd
+        info = ("", "")
+    _SESSION_INFO[surface] = (info, time.time())
+    return info
+
+
+def session_cwd(surface: str) -> str:
+    return session_info(surface)[0]
 
 
 def handle_prompt(cfg: Config, watcher: Watcher, tail: str, prompt) -> None:
@@ -1711,7 +1784,9 @@ def handle_prompt(cfg: Config, watcher: Watcher, tail: str, prompt) -> None:
     if now - watcher.prompt_since < PROMPT_QUIET_SECONDS:
         return
     profile = watcher.profile
-    rule, reason = prompt_rule_for(profile, prompt, session_cwd(watcher.surface))
+    cwd, transcript = session_info(watcher.surface)
+    rule, reason = prompt_rule_for(profile, prompt, cwd,
+                                   pending=lambda name: pending_write_paths(transcript, name))
     blocked = ""
     if not rule:
         blocked = reason
