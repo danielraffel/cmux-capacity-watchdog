@@ -7,7 +7,7 @@ cmux tabs, and types for you in two situations:
 | Situation | What it types | Agents |
 |---|---|---|
 | A turn stopped on a temporary provider error (model at capacity, overloaded, `API Error: 5xx`, a dropped or stalled response) | `continue`, or `/goal resume` for a Codex goal | Claude, Codex |
-| Claude asks permission to save one of its own memory notes ("Do you want to create MEMORY.md?") | `1` (Yes) | Claude |
+| Claude asks permission to create or edit one of its own memory notes ("Do you want to create MEMORY.md?"); off until you turn it on | `1` (Yes) | Claude |
 
 Everything else (other permission prompts, a deliberate pause, a finished
 turn, an unsent draft) is left for you. It works with or without
@@ -72,8 +72,11 @@ Each setting is per agent: put it under `"claude"` or `"codex"`.
 ```
 
 Check what's in force with
-`python3 ~/bin/cmux-capacity-watchdog.py --check-rules`. A file with a mistake
-is ignored (the previous good settings stay) and the log says why.
+`python3 ~/bin/cmux-capacity-watchdog.py --check-rules`. The file is checked
+when it loads: an unknown agent or setting, a value of the wrong type (say
+`"enabled": "false"` instead of `false`) or a pattern that doesn't compile
+rejects the whole file. The previous good settings stay, and the log says
+why.
 
 To leave one tab alone, add its surface ID, or `title:<part of the tab title>`,
 to `~/.config/cmux-capacity-watchdog/ignore`, one per line.
@@ -85,10 +88,17 @@ python3 ~/bin/cmux-capacity-watchdog.py --problems      # this Mac, last 6 hours
 ./fleet-report.sh 24                                    # several Macs, last 24 hours
 ```
 
-`--problems` prints what was resumed and answered, then names every session
-that needs you: a prompt nobody answered, a resume that keeps failing, a
-session that was already stopped when the watchdog started. Each line gives
-the agent, workspace, tab title and surface ID. For `fleet-report.sh`, list
+`--problems` prints what was resumed and answered, then names the sessions
+that still need you. Those include:
+
+- a prompt waiting more than 5 minutes;
+- a prompt still showing after it was answered;
+- a resume that keeps failing, or one left unsent;
+- a session that was already stopped on an error when the watchdog started.
+
+Each line gives the agent, workspace, tab title and full surface ID. An item
+drops off once that session is working again, however it got unstuck. The
+command exits 1 when something is listed. For `fleet-report.sh`, list
 your Macs' ssh names in `~/.config/cmux-capacity-watchdog/fleet`, one per line
 (`local` is this Mac).
 
@@ -98,7 +108,8 @@ Logs are in `~/.local/state/`:
 - `cmux-capacity-watchdog.jsonl` holds one JSON event per action;
 - `--report` totals the JSON events.
 
-Each log rolls over at 20 MB and keeps one previous file.
+Each log rolls over at 20 MB and keeps one previous file. Both are readable
+only by you, since they can quote what's on screen.
 
 ## How it decides
 
@@ -118,14 +129,28 @@ Each log rolls over at 20 MB and keeps one previous file.
 
 **Prompts.**
 
-- It answers only a prompt that has sat unchanged for 5 seconds, at most
-  twice. If it's still showing, it's left for you and reported.
-- A memory-note prompt is answered only when the file resolves to
-  `<root>/projects/<project>/memory/<name>.md` under one of your Claude
-  folders (`~/.claude`, or Subrouter's `~/.subrouter/codex/claude-proxy/*`).
-  A file named `MEMORY.md` anywhere else, or a project's own `.claude`
-  folder, never qualifies.
-- Every prompt is recorded, answered or not.
+- It answers a prompt only after seeing it unchanged on two polls at least 5
+  seconds apart (about a minute at the default poll), and it re-reads the
+  screen just before typing.
+- It answers the same prompt at most twice in a row and three times an hour.
+  After that the prompt is left for you and reported.
+- It answers only a live prompt at the bottom of the screen. A prompt quoted
+  in output, or one with Claude's input box still showing, is ignored.
+- The only built-in rule covers Claude's file prompts: create, overwrite or
+  edit. It answers only when the path Claude draws under the prompt's title
+  resolves to `<root>/projects/<project>/memory/<name>.md` under one of your
+  Claude folders (`~/.claude`, or Subrouter's
+  `~/.subrouter/codex/claude-proxy/*`). That rules out:
+  - a file named `MEMORY.md` anywhere else;
+  - a project's own `.claude` folder;
+  - a symlink out of the memory folder;
+  - a relative path when the session's directory is unknown.
+- Text the model writes (a file preview, a command's description) is never
+  used as evidence.
+- Shell-command prompts are never answered: a command can't be shown to be
+  safe from its on-screen text.
+- Every answer is recorded, and so is every prompt left waiting more than 5
+  minutes, with the reason it wasn't answered.
 
 ## Advanced rules
 

@@ -7,6 +7,8 @@ retry/backoff, confirmation, novelty, and retry-limit semantics are unchanged.
 """
 
 import importlib.util
+from datetime import datetime
+import json
 import os
 import time
 import unittest
@@ -446,7 +448,7 @@ class PromptAnswerTest(unittest.TestCase):
         with mock.patch.dict(watchdog.PROFILES, {"claude": profile}), \
              mock.patch.object(watchdog, "session_cwd", lambda surface: self.CWD), \
              mock.patch.object(watchdog, "cmux", lambda *args, **kw: sends.append(args) or ""), \
-             mock.patch.object(watchdog, "read_tail", return_value="answered\n"), \
+             mock.patch.object(watchdog, "read_tail", side_effect=[tail, "answered\n"]), \
              mock.patch.object(watchdog.time, "sleep", lambda s: None), \
              mock.patch.object(watchdog, "record",
                                lambda cfg, event, **fields: events.append(event)):
@@ -480,6 +482,55 @@ class LogRotationTest(unittest.TestCase):
             watchdog.rotate_if_large(path)
         self.assertFalse(os.path.exists(path))
         self.assertTrue(os.path.exists(path + ".1"))
+
+
+class ProblemsReportTest(unittest.TestCase):
+    def write(self, events):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "stats.jsonl")
+        now = time.time()
+        with open(path, "w") as handle:
+            for offset, (event, fields) in enumerate(events):
+                stamp = datetime.fromtimestamp(now - 300 + offset).isoformat(timespec="seconds")
+                handle.write(json.dumps({"ts": stamp, "event": event, **fields}) + "\n")
+        return path
+
+    def run_problems(self, path):
+        import io, contextlib
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = watchdog.problems(path, 1)
+        return status, out.getvalue()
+
+    def test_an_alarm_clears_when_the_session_recovers(self):
+        path = self.write([
+            ("scan_completed", {}),
+            ("prompt_waiting", {"surface": "S1", "agent": "claude", "title": "t", "question": "q?", "reason": "r"}),
+            ("became_busy", {"surface": "S1"}),
+            ("slow_lane", {"surface": "S2", "agent": "codex", "title": "build"}),
+            ("scan_completed", {}),
+        ])
+        status, text = self.run_problems(path)
+        self.assertEqual(status, 1)
+        self.assertNotIn("S1", text)
+        self.assertIn("resume keeps failing", text)
+        self.assertIn("[S2]", text)
+
+    def test_a_deliberate_pause_is_not_a_problem(self):
+        path = self.write([
+            ("scan_completed", {}),
+            ("primed_stopped", {"surface": "S3", "marker": "goal stalled"}),
+        ])
+        self.assertEqual(self.run_problems(path)[0], 0)
+
+    def test_large_logs_report_quickly(self):
+        events = [("scan_completed", {})]
+        for index in range(200_000):
+            events.append(("stop_detected" if index % 2 else "resumed", {"surface": f"S{index % 600}"}))
+        path = self.write(events)
+        started = time.time()
+        self.run_problems(path)
+        self.assertLess(time.time() - started, 5.0)
 
 
 class RulesFileTest(unittest.TestCase):

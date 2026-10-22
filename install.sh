@@ -29,6 +29,7 @@ status() {
     fi
     [ -f "$SCRIPT" ] && echo "  installed: $(grep -m1 '^WATCHDOG_VERSION' "$SCRIPT" | cut -d'"' -f2)"
     [ -f "$STATE/cmux-capacity-watchdog.log" ] && { echo "  recent log:"; tail -n 5 "$STATE/cmux-capacity-watchdog.log" | sed 's/^/    /'; }
+    return 0
 }
 
 case "${1:-}" in
@@ -51,6 +52,8 @@ if ! "$PYTHON" "$HERE/cmux-capacity-watchdog.py" --check-rules >/dev/null; then
 fi
 
 mkdir -p "$BIN_DIR" "$STATE" "$CONFIG" "$(dirname "$PLIST")"
+# Logs can hold screen excerpts; keep existing ones private too.
+chmod 600 "$STATE"/cmux-capacity-watchdog*.log "$STATE"/cmux-capacity-watchdog*.jsonl* 2>/dev/null || true
 # A plain copy, never a symlink: launchd refuses to exec a script whose
 # target lives on an external volume.
 cp "$HERE/cmux-capacity-watchdog.py" "$SCRIPT.new"

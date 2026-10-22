@@ -18,7 +18,8 @@ earlier of the next poll or the earliest due retry — so the fast lane keeps
 its 5s→60s exponential spacing without any session blocking the global scan.
 
 Usage:
-    cmux-capacity-watchdog.py --surface <id|ref> [--surface ...] [--interval 300] [--dry-run] [--log FILE]
+    cmux-capacity-watchdog.py --all [--interval 60] [--dry-run] [--log FILE]
+    cmux-capacity-watchdog.py --problems [HOURS] | --report | --check-rules | --classify FILE
 """
 
 import argparse
@@ -65,11 +66,12 @@ CMUX = running_clis()[0]
 SURFACE_CLI = {}  # surface id -> the CLI of the app that owns it
 # --dry-run: no keystroke ever reaches a tab, whichever code path asks.
 DRY_RUN = False
+INSTANCE_LOCK = None  # held for the process lifetime
 
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-10-21.3"
+WATCHDOG_VERSION = "2026-10-22.1"
 
 # Per-agent rules: how to recognise the agent's screen, when it is busy, what
 # its composer looks like, which on-screen errors are resume evidence, and
@@ -229,6 +231,59 @@ def build_profiles(overrides: dict) -> dict:
     return profiles
 
 
+def validate_overrides(data) -> dict:
+    """The rules file's agent overrides, checked against the defaults: known
+    agents and keys only, each value the same type as its default (lists of
+    strings stay lists, booleans stay booleans), patterns that compile, and
+    well-formed prompt rules. Raises ValueError naming the first problem."""
+    if not isinstance(data, dict):
+        raise ValueError("the file must hold a JSON object")
+    unknown = set(data) - {"agents"}
+    if unknown:
+        raise ValueError(f"unknown top-level key {sorted(unknown)[0]!r}")
+    agents = data.get("agents", {})
+    if not isinstance(agents, dict):
+        raise ValueError('"agents" must be an object')
+    for agent, overrides in agents.items():
+        if agent not in DEFAULT_PROFILES:
+            raise ValueError(f"unknown agent {agent!r} (known: {', '.join(DEFAULT_PROFILES)})")
+        if not isinstance(overrides, dict):
+            raise ValueError(f"{agent}: settings must be an object")
+        defaults = DEFAULT_PROFILES[agent]
+        for key, value in overrides.items():
+            base = key[:-4] if key.endswith("_add") else key
+            if base not in defaults:
+                raise ValueError(f"{agent}: unknown setting {key!r}")
+            default = defaults[base]
+            if key.endswith("_add") and not isinstance(default, list):
+                raise ValueError(f"{agent}: {key!r} can only extend a list setting")
+            if isinstance(default, bool):
+                ok = isinstance(value, bool)
+            elif isinstance(default, int):
+                ok = isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            elif isinstance(default, list):
+                ok = isinstance(value, list)
+            else:
+                ok = isinstance(value, type(default))
+            if not ok:
+                raise ValueError(f"{agent}: {key!r} must be {type(default).__name__}")
+            if base == "prompt_rules":
+                for rule in value:
+                    if not isinstance(rule, dict) or not isinstance(rule.get("question"), str) \
+                            or not isinstance(rule.get("answer"), str) or not rule["answer"] \
+                            or rule.get("files") != "claude-memory":
+                        raise ValueError(f'{agent}: each prompt rule needs "question", "answer" '
+                                         f'and "files": "claude-memory"')
+                    re.compile(rule["question"])
+            elif isinstance(default, list):
+                if not all(isinstance(item, str) for item in value):
+                    raise ValueError(f"{agent}: {key!r} must be a list of strings")
+                if "regex" in base:
+                    for pattern in value:
+                        re.compile(pattern)
+    return agents
+
+
 class RulesLoader:
     """Reload RULES_FILE when it changes; keep the last good rules otherwise."""
 
@@ -255,10 +310,7 @@ class RulesLoader:
         try:
             with open(self.path) as handle:
                 data = json.load(handle)
-            agents = data.get("agents", {})
-            for pattern in (p for rules in agents.values() for key, value in rules.items()
-                            if "regex" in key for p in value):
-                re.compile(pattern)
+            agents = validate_overrides(data)
             self.profiles = build_profiles(agents)
             self.error = ""
             log_fn(f"rules loaded from {self.path}")
@@ -328,7 +380,7 @@ def load_ignore_rules() -> tuple:
                     ids.add(line)
     except FileNotFoundError:
         pass  # no exclusions configured is a normal state
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         print(f"WARNING: ignore file unreadable ({exc}); failing closed, no resumes until it reads", flush=True)
         return ids, title_parts, False
     return ids, title_parts, True
@@ -567,8 +619,10 @@ def detect_agent(tail: str, profiles: dict) -> str:
     plain text that a Claude transcript could quote."""
     lines = tail.splitlines()
     for name, profile in profiles.items():
-        if profile.enabled and profile.rules.get("detect_composer") and bordered_composer_index(lines) >= 0:
-            return name
+        if profile.rules.get("detect_composer") and bordered_composer_index(lines) >= 0:
+            # A disabled agent's screen is still that agent's: never let it
+            # fall through to another agent's looser text markers.
+            return name if profile.enabled else ""
     # A Claude permission prompt's footer, as the screen's last line. Text
     # quoted higher up (a README, a transcript) doesn't count.
     last = next((line.strip().lower() for line in reversed(lines) if line.strip()), "")
@@ -617,6 +671,7 @@ class Watcher:
     prompt_reported: bool = False  # an unanswered prompt is reported once
     prompt_attempts: int = 0
     prompt_answers: dict = field(default_factory=dict)  # fingerprint -> answer times
+    was_busy: bool = False  # last poll saw a running turn
     last_fingerprint: str = ""
     actions_on_stop: int = 0
     next_action_at: float = 0.0
@@ -666,12 +721,18 @@ def rotate_if_large(path: str) -> None:
 
 
 def log(cfg: Config, message: str) -> None:
+    """Append to the log file, or print when there is none (the LaunchAgent
+    sends stdout to a file that is never rotated). Never raises."""
     line = f"{datetime.now().isoformat(timespec='seconds')} {message}"
-    print(line, flush=True)
-    if cfg.log_file:
+    if not cfg.log_file:
+        print(line, flush=True)
+        return
+    try:
         rotate_if_large(cfg.log_file)
         with open_private_append(cfg.log_file) as handle:
             handle.write(line + "\n")
+    except OSError:
+        pass
 
 
 def record(cfg: Config, event: str, **fields) -> None:
@@ -1058,7 +1119,7 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
         watcher.parked = True
         backoff = profile.slow_lane_interval
         log(cfg, f"{watcher.surface}: slow lane after {watcher.actions_on_stop} quick attempts; retrying every {profile.slow_lane_interval // 60}m")
-        record(cfg, "slow_lane", surface=watcher.surface, attempts=watcher.actions_on_stop)
+        record(cfg, "slow_lane", surface=watcher.surface, title=watcher.title, attempts=watcher.actions_on_stop)
         notify("watchdog: session in slow lane", f"{watcher.surface} keeps failing to resume")
     if outcome == "unconfirmed":
         # Never pile a second send into a slow-starting turn.
@@ -1127,15 +1188,19 @@ def recorded_agents(cli: str) -> dict:
     except Exception:
         return {}
     newest = {}
-    for session in data.get("sessions", []) if isinstance(data, dict) else []:
+    sessions = data.get("sessions") if isinstance(data, dict) else None
+    for session in sessions if isinstance(sessions, list) else []:
+        if not isinstance(session, dict):
+            continue
         surface, agent = session.get("surface_id"), session.get("agent")
-        if not surface or agent not in PROFILES:
+        if not isinstance(surface, str) or not isinstance(agent, str) or agent not in PROFILES:
             continue
         # Most records are of agents that have exited; a shell may now run
         # in that tab. Only a live session names the tab's agent.
         if not session.get("active_for_surface") or not session.get("stored_pid_exists"):
             continue
-        stamp = session.get("updated_at_unix") or 0
+        stamp = session.get("updated_at_unix")
+        stamp = stamp if isinstance(stamp, (int, float)) else 0
         if surface not in newest or stamp >= newest[surface][1]:
             newest[surface] = (agent, stamp)
     return {surface: agent for surface, (agent, _) in newest.items()}
@@ -1213,28 +1278,35 @@ def problems(stats_file: str, since_hours: float) -> int:
             issues.append(f"last scan {int(age // 60)} min ago; the watchdog may be stuck")
     def where(e):
         return (f"{e.get('agent', '?')} \"{e.get('title') or '-'}\" in \"{e.get('workspace') or '-'}\" "
-                f"[{(e.get('surface') or '')[:8]}]")
+                f"[{e.get('surface') or '?'}]")
+    clears = {"resumed", "prompt_answered", "witnessed_busy", "became_busy", "prompt_gone"}
+    describe = {
+        "prompt_waiting": lambda e: f"prompt waiting on a person ({e.get('reason')}): {e.get('question')!r}",
+        "prompt_answer_failed": lambda e: f"prompt still showing after answers: {e.get('question')!r}",
+        "slow_lane": lambda e: "resume keeps failing (slow lane)",
+        "orphan_enter_gave_up": lambda e: "a resume command sits unsent in the input box",
+        "ambiguous_gave_up": lambda e: "a resume command may not have been submitted",
+        "ambiguous_assumed_submitted": lambda e: "a resume was sent but never confirmed",
+        "stale_stop_skipped": lambda e: f"stopped on {e.get('marker')!r} before the watchdog saw it working; resume it once by hand",
+        "primed_stopped": lambda e: f"stopped on {e.get('marker')!r} before the watchdog saw it working; resume it once by hand",
+    }
     counts = {}
+    open_issues = {}
     for e in events:
-        counts[e.get("event")] = counts.get(e.get("event"), 0) + 1
-    latest = {}
-    for e in events:
-        if e.get("surface"):
-            latest[(e["surface"], e.get("event"))] = e
-    # Sessions currently waiting on something the watchdog will not do.
-    for (surface, event), e in sorted(latest.items(), key=lambda kv: kv[1].get("ts", "")):
-        later = [x for x in events if x.get("surface") == surface and x.get("ts", "") > e.get("ts", "")
-                 and x.get("event") in ("resumed", "witnessed_busy", "prompt_answered")]
-        if later:
+        kind = e.get("event")
+        counts[kind] = counts.get(kind, 0) + 1
+        surface = e.get("surface")
+        if not surface:
             continue
-        if event == "prompt_waiting":
-            issues.append(f"prompt waiting on a person ({e.get('reason')}): {e.get('question')!r} — {where(e)}")
-        elif event == "prompt_answer_failed":
-            issues.append(f"prompt still showing after two answers: {e.get('question')!r} — {where(e)}")
-        elif event == "slow_lane":
-            issues.append(f"resume keeps failing (slow lane) — {where(e)}")
-        elif event in ("stale_stop_skipped", "primed_stopped") and (e.get("marker") or "") not in ("goal stalled", "goal paused", ""):
-            issues.append(f"stopped on {e.get('marker')!r} before the watchdog saw it working; resume it once by hand — {where(e)}")
+        if kind in clears:
+            open_issues.pop(surface, None)
+        elif kind in describe:
+            if kind in ("stale_stop_skipped", "primed_stopped") and \
+                    (e.get("marker") or "") in ("goal stalled", "goal paused", "pursuing goal (idle)", ""):
+                continue  # a deliberate pause, not a problem
+            open_issues[surface] = e
+    for surface, e in sorted(open_issues.items(), key=lambda kv: kv[1].get("ts", "")):
+        issues.append(f"{describe[e['event']](e)} — {where(e)}")
     print(f"{host}: {counts.get('resumed', 0)} resumed, {counts.get('prompt_answered', 0)} prompts answered, "
           f"{counts.get('stop_detected', 0)} stops seen, {len(scans)} scans in the last {since_hours:g} h")
     for issue in issues:
@@ -1574,14 +1646,17 @@ def session_cwd(surface: str) -> str:
     try:
         data = json.loads(cmux("sessions", "list", "--json", "--surface", surface,
                                cli=SURFACE_CLI.get(surface, "")))
-        for session in data.get("sessions", []):
-            if not session.get("active_for_surface") or not session.get("stored_pid_exists"):
+        sessions = data.get("sessions") if isinstance(data, dict) else None
+        for session in sessions if isinstance(sessions, list) else []:
+            if not isinstance(session, dict) or not session.get("active_for_surface") \
+                    or not session.get("stored_pid_exists"):
                 continue
             # Claude draws a relative path against the directory it started
             # in, which can differ from where its shell later moved.
             cwd = session.get("launch_working_directory") or session.get("cwd") or ""
-            if cwd:
+            if isinstance(cwd, str) and cwd:
                 break
+            cwd = ""
     except Exception:
         cwd = ""
     _SESSION_CWDS[surface] = (cwd, time.time())
@@ -1628,11 +1703,17 @@ def handle_prompt(cfg: Config, watcher: Watcher, tail: str, prompt) -> None:
             record(cfg, "prompt_answer_failed", surface=watcher.surface, title=watcher.title,
                    workspace=watcher.workspace, question=question[:200], file=file)
         return
-    watcher.prompt_attempts += 1
     if cfg.dry_run:
         log(cfg, f"{watcher.surface}: DRY-RUN would answer {rule['answer']!r} to {question!r}")
         return
+    watcher.prompt_attempts += 1
     try:
+        # The working-directory lookup can take a moment: answer only if
+        # the very same prompt is still the last thing on screen.
+        current = find_pending_prompt(read_tail(watcher.surface, profile.tail_lines))
+        if not current or hashlib.sha1(f"{current[0]}\n{_unwrap(current[2][-6:])}".encode()).hexdigest()[:12] != fp:
+            watcher.prompt_fingerprint = ""
+            return
         cmux("send", "--surface", watcher.surface, rule["answer"])
         time.sleep(1.5)
         after = find_pending_prompt(read_tail(watcher.surface, profile.tail_lines))
@@ -1662,8 +1743,13 @@ def poll_surface(cfg: Config, watcher: Watcher, pinned: set) -> bool:
         if prompt:
             handle_prompt(cfg, watcher, tail, prompt)
             return False
+        if watcher.prompt_fingerprint and watcher.prompt_reported:
+            # Someone answered a prompt that was reported as waiting.
+            record(cfg, "prompt_gone", surface=watcher.surface, title=watcher.title)
         watcher.prompt_fingerprint = ""
         state, marker = classify(tail, watcher.profile)
+        if state != "busy":
+            watcher.was_busy = False
         if state == "retrying":
             # The agent is retrying on its own. That is neither a running
             # turn (a resume that only got this far did not work, so a
@@ -1686,6 +1772,11 @@ def poll_surface(cfg: Config, watcher: Watcher, pinned: set) -> bool:
             # A running turn proves the last resume worked; re-arm.
             if watcher.last_seen_busy == 0:
                 record(cfg, "witnessed_busy", surface=watcher.surface, title=watcher.title)
+            elif not watcher.was_busy:
+                # Cheap transition marker: lets --problems clear an alarm
+                # once the session is working again, however it got there.
+                record(cfg, "became_busy", surface=watcher.surface, title=watcher.title)
+            watcher.was_busy = True
             watcher.last_seen_busy = time.time()
             watcher.last_fingerprint = ""
             watcher.actions_on_stop = 0
@@ -1793,12 +1884,12 @@ def classify_file(path: str) -> int:
 
 
 def main() -> int:
-    global WITNESS_FILE, DRY_RUN
+    global WITNESS_FILE, DRY_RUN, INSTANCE_LOCK
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--surface", action="append", default=[], help="cmux surface id or ref; repeatable")
     parser.add_argument("--all", action="store_true", help="discover every agent session cmux knows about (all enabled agents)")
     parser.add_argument("--all-codex", action="store_true", help=argparse.SUPPRESS)  # pre-Claude spelling of --all
-    parser.add_argument("--interval", type=float, default=60.0, help="seconds between steady-state polls (default 60; sends are time-gated, so faster polls never mean faster sends; a detected stop is worked at full speed inline)")
+    parser.add_argument("--interval", type=float, default=60.0, help="seconds between steady-state polls (default 60; sends are time-gated by backoff, so faster polls never mean faster sends)")
     parser.add_argument("--dry-run", action="store_true", help="classify and log, never send")
     parser.add_argument("--log", default="", help="append actions to this file")
     parser.add_argument("--stats", default=os.path.expanduser("~/.local/state/cmux-capacity-watchdog.jsonl"),
@@ -1831,6 +1922,15 @@ def main() -> int:
 
     WITNESS_FILE = args.witness_file
     DRY_RUN = args.dry_run
+    # One watcher per stats file: two would both type into the same tabs.
+    import fcntl
+    os.makedirs(os.path.dirname(os.path.abspath(args.stats)), exist_ok=True)
+    INSTANCE_LOCK = open(args.stats + ".lock", "w")
+    try:
+        fcntl.flock(INSTANCE_LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"another watchdog already runs with {args.stats}; exiting", file=sys.stderr)
+        return 0
     cfg = Config(interval=args.interval, dry_run=args.dry_run, log_file=args.log, stats_file=args.stats)
     witnesses = load_witnesses(lambda message: log(cfg, message))
     for surface in args.surface:
@@ -1869,7 +1969,10 @@ def main() -> int:
         # Rule edits apply on the next cycle; watchers read PROFILES live.
         PROFILES.update(loader.load(lambda message: log(cfg, message)))
         if discover and time.time() - last_discovery >= DISCOVERY_INTERVAL:
-            discover_surfaces(cfg, witnesses)
+            try:
+                discover_surfaces(cfg, witnesses)
+            except Exception as exc:
+                log(cfg, f"discovery failed: {exc!r}")
             last_discovery = time.time()
         for watcher in list(cfg.watchers.values()):
             if not watcher.profile.enabled:

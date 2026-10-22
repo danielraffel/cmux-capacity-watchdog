@@ -20,9 +20,8 @@ if [ ${#HOSTS[@]} -eq 0 ]; then
             line="${line%%#*}"; line="${line//[[:space:]]/}"
             [ -n "$line" ] && HOSTS+=("$line")
         done < "$FLEET_FILE"
-    else
-        HOSTS=(local)
     fi
+    [ ${#HOSTS[@]} -gt 0 ] || HOSTS=(local)
 fi
 
 status=0
