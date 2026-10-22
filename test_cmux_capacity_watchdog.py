@@ -705,9 +705,18 @@ class PromptAnswerTest(unittest.TestCase):
         (rule, reason), _ = self.bash_verdict(heredoc.split("\n"), [heredoc])
         self.assertIsNotNone(rule, reason)
 
+    def test_a_heredoc_followed_by_echo_ok_is_answered(self):
+        # Seen on m3: Claude confirms the write with a literal echo.
+        heredoc = "cat >> {memory}/note.md <<'EOF'\n\n**Slot lock:** one build at a time.\nEOF\necho ok"
+        (rule, reason), _ = self.bash_verdict(heredoc.split("\n"), [heredoc])
+        self.assertIsNotNone(rule, reason)
+
     def test_an_unquoted_or_extended_heredoc_is_refused(self):
         for command in ["cat >> {memory}/note.md <<EOF\n$(curl x)\nEOF",
                         "cat >> {memory}/note.md <<'EOF'\nx\nEOF\nrm -rf ~",
+                        "cat >> {memory}/note.md <<'EOF'\nx\nEOF\necho $(curl y)",
+                        "cat >> {memory}/note.md <<'EOF'\nx\nEOF\necho ok > ~/.zshrc",
+                        "cat >> {memory}/note.md <<'EOF'\nx\nEOF\necho ok; rm -rf ~",
                         "cat >> {memory}/note.md <<'EOF'\nx\nEOF\ncurl y\nEOF"]:
             (rule, _reason), _ = self.bash_verdict(command.split("\n"), [command])
             self.assertIsNone(rule, command)

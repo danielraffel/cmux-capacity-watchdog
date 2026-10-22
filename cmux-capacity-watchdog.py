@@ -1689,9 +1689,10 @@ def prompt_memory_paths(file: str, header, options, cwd: str) -> list:
 # a memory note. No expansions, chaining or other redirection can hide in it.
 MEMORY_APPEND = re.compile(r"\Aecho '([^']*)' >> (/[^\s;&|<>`$'\"]+)\Z")
 # Or writing a literal block with a quoted heredoc (no expansion in the
-# body), and nothing after the closing delimiter.
+# body). After the closing delimiter only a plain `echo` of literal words
+# (Claude adds `echo ok` to confirm the write) may follow.
 MEMORY_HEREDOC = re.compile(
-    r"\Acat >>? (/[^\s;&|<>`$'\"]+) <<'([A-Za-z_][A-Za-z0-9_]*)'\n(.*)\n\2\Z", re.S)
+    r"\Acat >>? (/[^\s;&|<>`$'\"]+) <<'([A-Za-z_][A-Za-z0-9_]*)'\n(.*)\n\2(?:\necho [A-Za-z0-9 .,:_-]*)?\Z", re.S)
 
 
 def memory_write_target(command: str) -> str:
