@@ -71,7 +71,7 @@ INSTANCE_LOCK = None  # held for the process lifetime
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-10-22.7"
+WATCHDOG_VERSION = "2026-10-22.8"
 
 # Per-agent rules: how to recognise the agent's screen, when it is busy, what
 # its composer looks like, which on-screen errors are resume evidence, and
@@ -1737,14 +1737,18 @@ def memory_write_target(command: str) -> str:
 
 def bash_box_command(header) -> str:
     """The command Claude draws in its "Bash command" box, between the ╌
-    rules under that title, after the last ─ rule. "" when not visible."""
+    rules under that title, after the last ─ rule. A long command scrolls
+    the title off the top; then the first ╌ pair is the box. "" when not
+    visible. Only a pointer: the command still has to be exactly one
+    pending call."""
     lines = [line.rstrip() for line in header]
     rule = max((i for i, line in enumerate(lines) if line.strip() and set(line.strip()) == {"─"}), default=-1)
     lines = lines[rule + 1:]
     titles = [i for i, line in enumerate(lines) if line.strip().startswith("Bash command")]
-    if len(titles) != 1:
+    if len(titles) > 1:
         return ""
-    dashes = [i for i in range(titles[0] + 1, len(lines)) if lines[i].strip() and set(lines[i].strip()) <= set("╌")]
+    start = titles[0] + 1 if titles else 0
+    dashes = [i for i in range(start, len(lines)) if lines[i].strip() and set(lines[i].strip()) <= set("╌")]
     if len(dashes) < 2:
         return ""
     body = lines[dashes[0] + 1:dashes[1]]
@@ -1757,7 +1761,7 @@ def _squash(text: str) -> str:
     return "".join(text.split())
 
 
-def prompt_rule_for(profile: Profile, prompt, cwd: str, pending=None, pending_any=None):
+def prompt_rule_for(profile: Profile, prompt, cwd: str, pending=None, pending_any=None, pending_bash=None):
     """(rule, reason): the first rule that answers the prompt, or None and
     the reason none did, for the record. Every rule must say which files it
     covers; only "claude-memory" exists. `pending(file)` returns the target
@@ -1785,8 +1789,9 @@ def prompt_rule_for(profile: Profile, prompt, cwd: str, pending=None, pending_an
                 # A shell command: the call is the pending Bash whose command
                 # is exactly the one Claude shows, and it must be a plain
                 # append of a literal line to a memory note.
-                matches = [command for name, _path, command in calls
-                           if name == "Bash" and _squash(command) == _squash(shown)]
+                bash_calls = pending_bash() if pending_bash else calls
+                matches = sorted({command for name, _path, command in bash_calls
+                                  if name == "Bash" and _squash(command) == _squash(shown)})
                 if len(matches) != 1:
                     reason = "the shown command is not exactly one pending call"
                     continue
@@ -2019,7 +2024,9 @@ def handle_prompt(cfg: Config, watcher: Watcher, tail: str, prompt) -> None:
         profile, prompt, cwd,
         pending=lambda name: [path for tool, path, _cmd in calls
                               if tool in FILE_TOOLS and path and os.path.basename(path) == name],
-        pending_any=lambda: pending_tool_calls(transcript))
+        pending_any=lambda: pending_tool_calls(transcript),
+        # The Feed log holds the request even when the transcript doesn't.
+        pending_bash=lambda: calls)
     blocked = ""
     if not rule:
         blocked = reason
