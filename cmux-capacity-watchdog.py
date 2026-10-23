@@ -71,7 +71,7 @@ INSTANCE_LOCK = None  # held for the process lifetime
 # Bump on EVERY behavior change. Every stats event carries this version, so
 # logs and reports stay interpretable across policy changes; the git history
 # maps versions to commits.
-WATCHDOG_VERSION = "2026-10-22.11"
+WATCHDOG_VERSION = "2026-10-23.1"
 
 # Per-agent rules: how to recognise the agent's screen, when it is busy, what
 # its composer looks like, which on-screen errors are resume evidence, and
@@ -1245,6 +1245,12 @@ def discover_app(cfg: Config, witnesses: dict, cli: str) -> None:
         surfaces = app_surfaces(cli)
     except Exception as exc:
         log(cfg, f"discovery: listing failed via {cli}: {exc}")
+        error = str(exc)
+        lowered = error.lower()
+        event = ("cmux_access_denied"
+                 if "access denied" in lowered and "only processes started inside cmux" in lowered
+                 else "discovery_error")
+        record(cfg, event, cli=cli, error=error[:500])
         return
     recorded = recorded_agents(cli)
     for sid, title, workspace in surfaces:
@@ -1304,6 +1310,10 @@ def problems(stats_file: str, since_hours: float) -> int:
     host = socket.gethostname().split(".")[0]
     scans = [e for e in events if e.get("event") == "scan_completed"]
     issues = []
+    denied = [e for e in events if e.get("event") == "cmux_access_denied"]
+    discoveries = [e for e in events if e.get("event") == "discovery_ok"]
+    if denied and (not discoveries or denied[-1].get("ts", "") > discoveries[-1].get("ts", "")):
+        issues.append("cmux denied watchdog socket access; set Settings → Automation → Socket control to Password or Allow all")
     if not scans:
         issues.append("watchdog has not completed a scan in this window")
     else:
@@ -2526,8 +2536,10 @@ def main() -> int:
         if discover and time.time() - last_discovery >= DISCOVERY_INTERVAL:
             try:
                 discover_surfaces(cfg, witnesses)
+                record(cfg, "discovery_ok")
             except Exception as exc:
                 log(cfg, f"discovery failed: {exc!r}")
+                record(cfg, "discovery_error", error=str(exc)[:500])
             last_discovery = time.time()
         for watcher in list(cfg.watchers.values()):
             if not watcher.profile.enabled:

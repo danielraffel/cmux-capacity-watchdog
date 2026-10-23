@@ -79,6 +79,7 @@ class RoundRobinTest(unittest.TestCase):
         # would wake on the steady-state cadence, not on A's timer.
         self.assertEqual(watchdog.next_wake(cfg), cfg.interval)
 
+
     def test_fast_lane_schedule_preserved_across_visits(self):
         """Per-visit attempts keep the old inline ladder's 5s→60s spacing,
         with the 45s grace floor after an unconfirmed send."""
@@ -160,6 +161,22 @@ FIXTURES = os.path.join(_HERE, "fixtures")
 def fixture(name):
     with open(os.path.join(FIXTURES, name)) as handle:
         return handle.read()
+
+
+class ProblemsHealthTest(unittest.TestCase):
+    def test_socket_access_denial_is_not_reported_green(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            stats = os.path.join(directory, "events.jsonl")
+            now = datetime.now().isoformat(timespec="seconds")
+            with open(stats, "w") as handle:
+                handle.write(json.dumps({"ts": now, "event": "watchdog_started"}) + "\n")
+                handle.write(json.dumps({"ts": now, "event": "cmux_access_denied",
+                                         "error": "Error: ERROR: Access denied - only processes started inside cmux can connect"}) + "\n")
+                handle.write(json.dumps({"ts": now, "event": "scan_completed", "surfaces": 0}) + "\n")
+            with mock.patch("sys.stdout") as stdout:
+                self.assertEqual(watchdog.problems(stats, 1), 1)
+            self.assertIn("cmux denied watchdog socket access", "".join(call.args[0] for call in stdout.write.call_args_list))
 
 
 class ClaudeScreenTest(unittest.TestCase):

@@ -100,6 +100,10 @@ that still need you. Those include:
 - a resume that keeps failing, or one left unsent;
 - a session that was already stopped on an error when the watchdog started.
 
+It also fails when cmux rejects the LaunchAgent's socket connection. Set
+**Settings → Automation → Socket control** to **Password** or **Allow all**;
+otherwise the worker can keep scanning while seeing zero sessions.
+
 Each line gives the agent, workspace, tab title and full surface ID. An item
 drops off once that session is working again, however it got unstuck. The
 command exits 1 when something is listed. For `fleet-report.sh`, list
