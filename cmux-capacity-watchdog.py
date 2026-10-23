@@ -1161,7 +1161,7 @@ def act(cfg: Config, watcher: Watcher, state: str, tail: str, marker: str = "") 
     watcher.next_action_at = now + backoff
 
 
-def discover_surfaces(cfg: Config, witnesses: dict) -> None:
+def discover_surfaces(cfg: Config, witnesses: dict) -> bool:
     """Find every agent session known to cmux and add it to the watch set.
 
     Enumeration is workspace -> pane surfaces -> a short screen read; the
@@ -1171,8 +1171,10 @@ def discover_surfaces(cfg: Config, witnesses: dict) -> None:
     profiles with fresh stop bookkeeping. Discovered surfaces that later
     vanish are dropped on read errors.
     """
+    ok = True
     for cli in running_clis():
-        discover_app(cfg, witnesses, cli)
+        ok = discover_app(cfg, witnesses, cli) and ok
+    return ok
 
 
 UUID_RE = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
@@ -1240,7 +1242,7 @@ def recorded_agents(cli: str) -> dict:
     return {surface: agent for surface, (agent, _) in newest.items()}
 
 
-def discover_app(cfg: Config, witnesses: dict, cli: str) -> None:
+def discover_app(cfg: Config, witnesses: dict, cli: str) -> bool:
     try:
         surfaces = app_surfaces(cli)
     except Exception as exc:
@@ -1251,7 +1253,7 @@ def discover_app(cfg: Config, witnesses: dict, cli: str) -> None:
                  if "access denied" in lowered and "only processes started inside cmux" in lowered
                  else "discovery_error")
         record(cfg, event, cli=cli, error=error[:500])
-        return
+        return False
     recorded = recorded_agents(cli)
     for sid, title, workspace in surfaces:
         title = title.replace("[selected]", "").strip()
@@ -1280,6 +1282,7 @@ def discover_app(cfg: Config, witnesses: dict, cli: str) -> None:
         cfg.watchers[sid] = Watcher(surface=sid, title=title, agent=agent, workspace=workspace,
                                     last_seen_busy=witnesses.get(sid, 0.0))
         log(cfg, f"discovery: now watching {agent} session {sid} ({title} in {workspace})")
+    return True
 
 
 def load_events(stats_file: str) -> list:
@@ -2535,8 +2538,8 @@ def main() -> int:
         PROFILES.update(loader.load(lambda message: log(cfg, message)))
         if discover and time.time() - last_discovery >= DISCOVERY_INTERVAL:
             try:
-                discover_surfaces(cfg, witnesses)
-                record(cfg, "discovery_ok")
+                if discover_surfaces(cfg, witnesses):
+                    record(cfg, "discovery_ok")
             except Exception as exc:
                 log(cfg, f"discovery failed: {exc!r}")
                 record(cfg, "discovery_error", error=str(exc)[:500])
